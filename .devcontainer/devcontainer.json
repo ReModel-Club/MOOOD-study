@@ -1,0 +1,20 @@
+{
+  "name": "Run MOOOD",
+
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+
+  "postCreateCommand": "gunicorn -b 0.0.0.0:80 index:server",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "charliermarsh.ruff"
+      ]
+    }
+  },
+
+  "forwardPorts": []
+}
