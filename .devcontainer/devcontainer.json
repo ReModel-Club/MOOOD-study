@@ -5,7 +5,7 @@
     "dockerfile": "Dockerfile"
   },
 
-  "postCreateCommand": "gunicorn -b 0.0.0.0:80 index:server",
+  "postCreateCommand": "mkdir data && gunicorn -b 0.0.0.0:80 index:server",
 
   "customizations": {
     "vscode": {

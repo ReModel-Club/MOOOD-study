@@ -1,10 +1,25 @@
-# oneoneone
-Modelling 111 patients with a primary care disposition
+# How to run the model: improved instructions
 
-Steps to build and run
+## Run locally (no Docker required!)
 
-1. Create directory and place DockerFile inside it
-2. cd into directory and use the command: docker build -t moood ./
-3. Start the container using the comamnd: docker run -p 8080:80 moood
+- Create a virtual environment using python 3.9 using your environment manager of choice (with `uv`, this is `uv venv --python 3.9`)
+- Install the corrected dependencies in requirements.txt into your virtual environment (with `uv`, use the command `uv pip install -r requirements.txt`)
+- Activate the environment (with `uv` on a Windows machine, use the command `.venv/Scripts/activate.ps1`)
+- Create an empty `data` folder in the root of the repository with `mkdir data`
+- Run the model with `python index.py` or, with `uv`: `uv run python index.py`
+- You should get a message in your terminal saying `Dash is running on http://some.numbers.go.here/`. Click on the http link to open the model interface in your browser.
 
-Reminder to self: You can run this locally with python index.py or the model only by uncommenting line 86 in oneoneonedes.py
+## Run using GitHub codespaces
+
+This way of running the model uses the Docker container specified in the repository.
+
+- Click the button below to create a codespace with the Docker container
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://github.com/codespaces/new?hide_repo_select=true&ref=improve-setup-instructions&repo=ReModel-Club/MOOOD-study)
+
+- Wait for the Codespace to be set up. This can take 5-10 minutes. You will know it is finished when it no longer says `Opening remote...` in the bottom left hand corner of the screen and instead says `>< Codespaces:`
+- A message asking if you trust the owners of the files will appear. Click `Trust folder and continue`
+- A popup will appear in the bottom right hand corner saying `Your application on a forwarded port is available`.
+- Click on `Ports` and then the small globe 🌐 icon next to the URL, to open the model interface in a new window.
+
+![](assets/codespace-ports.png)
