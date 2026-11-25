@@ -1,0 +1,307 @@
+# Health Service Model {#sec-health-service-model}
+
+In [Run Configuration and Orchestration](#sec-run-configuration-and-orchestration) we saw how form values become global parameters, and how `runSim` is called once per replication in a `multiprocessing` pool. Inside `runSim` there are only two interesting lines: build an `HSM`, then call `.run()` on it. This chapter opens that box.
+
+## What problem does `HSM` solve? {#sec-health-service-model-motivation}
+
+Suppose the user has asked for a 30-day simulation starting on 1 January 2021, with a one-day warm-up. The model must produce a believable stream of people phoning NHS 111, in the right numbers at the right times: a busy Monday morning, a quiet 3 a.m. on a Wednesday, and a different pattern again in summer. Each of those people then needs to be handed to the part of the model that follows them through the health service.
+
+That is the whole job of the **`HSM`** (Health Service Model) class in `hsm.py`. One `HSM` object is one replication: it owns a private clock, the shared services callers will queue for, and the tables that will record what happens. Its `run` method generates callers over time and then lets the clock run on for a further 72 hours so that callers who arrived during the configured run can be followed to the end of their window.
+
+::: {.column-margin}
+**HSM**: the `HSM` class in `hsm.py`. One instance simulates one replication of the whole 111-to-onward-care system. See the [glossary](glossary.qmd).
+:::
+
+The simulation clock does not tick steadily: it jumps from one scheduled event to the next.
+
+::: {.callout-note title="In the study"}
+The model implements the discrete-event simulation described in the BMJ Open paper (Pilbery et al., 2023), which asks how 111 callers move on to primary care, ED, 999 and inpatient care. The paper gives call arrivals an exponential distribution, with the rate stratified by hour of day, quarter and weekday or weekend. That is the structure of the lookup table and `random.expovariate` call in this chapter. For the wider study, see [The study behind the model](background.qmd).
+:::
+
+## Key concepts {#sec-health-service-model-concepts}
+
+**SimPy environment.** SimPy is a discrete-event simulation library. Its `simpy.Environment` holds the **simulation clock**, `env.now`, and a queue of scheduled events. Time does not tick along continuously: the clock jumps straight from one scheduled event to the next. In this model one unit of simulated time is one minute, which is why [the previous chapter](#sec-run-configuration-and-orchestration) converted durations from days to minutes.
+
+::: {.column-margin}
+**Simulation clock**: `env.now`, the current simulated time in minutes since the start of the replication. It is unrelated to wall-clock time.
+:::
+
+**Arrival generator.** A generator function that SimPy runs as a process. It creates one caller, then `yield`s a `timeout` for the **inter-arrival time** (the gap until the next call), and repeats. While it is suspended, SimPy is free to run other processes, such as the callers' own journeys.
+
+**Inter-arrival type (`ia_type`).** The user can choose how the gap is sampled: `base`, `max`, `minmax` or `mean`. The code's own comment says "SPOILER: base is the best!", and `oneoneonedes.py` defaults to it.
+
+## Setting up one replication {#sec-health-service-model-init}
+
+The constructor does all the set-up. The excerpt below covers the SimPy parts and the first lookup table.
+
+```{.python filename="hsm.py:38-61" code-line-style="dim:2,hi:3,hi:12,hi:15-19,hi:24"}
+    def __init__(self, run_number: int, sim_duration: int, warm_up_duration: int, sim_start_date: str, what_if_sim_run: str, transition_type: str, ia_type: str) :
+        print(f"Sim duration inside HSM model is {sim_duration}, transition is {transition_type} and inter_arrival: {ia_type}")
+        self.env = simpy.Environment()
+        self.patient_counter = 0
+        self.sim_duration = sim_duration
+        self.warm_up_duration = warm_up_duration
+        self.start_dt = sim_start_date
+        self.what_if_sim_run = what_if_sim_run
+
+        self.ia_type = ia_type
+
+        self.t = Transitions(transition_type)
+        self.transition_type = transition_type
+
+        self.GP = simpy.PriorityResource(self.env, capacity=G.number_of_gp)
+        self.ED = simpy.PriorityResource(self.env, capacity=G.number_of_ed)
+        self.Treble1 = simpy.PriorityResource(self.env, capacity=G.number_of_111)
+        self.Treble9 = simpy.PriorityResource(self.env, capacity=G.number_of_999)
+        self.IP = simpy.PriorityResource(self.env, G.number_of_IP)
+
+        self.mean_q_time_speak_to_gp = 0
+        self.mean_q_time_contact_gp = 0
+
+        self.GP_surgery_df =  pd.read_csv("csv/gp_surgeries.csv")
+```
+
+The signature mirrors the arguments `runSim` passes in, so every setting from the configuration form arrives here as a plain argument. The highlighted lines are the ones that matter most:
+
+- `self.env` is the fresh `simpy.Environment`. Because each `HSM` creates its own, two replications (even in the same worker process) never share a clock.
+- The `Transitions` object is configured by `transition_type`. How it samples routes is the subject of [Transitions and Time Distributions](#sec-transitions-and-time-distributions).
+- The five `simpy.PriorityResource` objects (GP, ED, 111, 999, inpatient) are the services callers could queue for. Their capacities come from `G` (see [Run Configuration and Orchestration](#sec-run-configuration-and-orchestration)) and are set very large, so in practice nobody waits for a free slot: the delays come from sampled wait times instead. (`Treble1` and `Treble9` are the project's names for the 111 and 999 services.) A `PriorityResource` is SimPy's queueing slot with priorities. A search of `hsm.py` finds no place where the journey code requests one, so they have no effect on results today.
+- `GP_surgery_df` loads `csv/gp_surgeries.csv`, a two-column table of `gp_surgery_id` and `prob`, used to give each caller a surgery.
+
+The rest of the constructor (lines 63-100) builds the empty event-log data frame, the network data frame and `node_lookup`, loads `csv/inter_arrival_times.csv`, and picks the output file paths depending on whether this is a what-if run. Those are covered in [Simulation Event Log and Network Data](#sec-simulation-event-log-and-network-data). The inter-arrival table is the one this chapter needs:
+
+```{.python filename="hsm.py:97-100"}
+        self.call_interarrival_times_lu = pd.read_csv("csv/inter_arrival_times.csv")
+
+        self.all_results_location = G.all_results_location if what_if_sim_run == 'No' else G.wi_all_results_location
+        self.network_graph_location = G.network_graph_location if what_if_sim_run == 'No' else G.wi_network_graph_location
+```
+
+The first line loads the arrival-rate table. Each row is keyed by quarter (`qtr`), a `weekday` flag (1 for weekday, 0 for weekend) and `exit_hour`, and carries columns such as `max_arrival_rate`, `min_arrival_rate` and `mean_inter_arrival_time`. The next two lines choose the baseline or what-if output paths.
+
+## Knowing what time it is {#sec-health-service-model-clock}
+
+The simulation clock only counts minutes. But arrival rates depend on the hour of day, the day of the week and the quarter of the year, so the model needs to turn "minutes elapsed" into a calendar date. That is `date_time_of_call`:
+
+```{.python filename="hsm.py:122-150" code-line-style="hi:17,hi:19,hi:23,hi:25,hi:27,hi:29"}
+    def date_time_of_call(self, start_dt: str, elapsed_time: int) -> list[int, int, str, int, pd.Timestamp]:
+        """
+        Calculate a range of time-based parameters given a specific date-time
+
+        **Returns:**
+            list(
+                `dow`             : int
+                `current_hour`    : int
+                `weekday`         : str
+                `current_quarter` : int
+                `current_dt`      : datetime
+            )
+
+        """
+        # Elapsed_time = time in minutes since simulation started
+
+        start_dt = pd.to_datetime(start_dt)
+
+        current_dt = start_dt + pd.Timedelta(elapsed_time, unit='min')
+
+        dow = current_dt.strftime('%a')
+        # 0 = Monday, 6 = Sunday
+        weekday = "weekday" if current_dt.dayofweek < 5 else "weekend"
+
+        current_hour = current_dt.hour
+
+        current_quarter = current_dt.quarter
+
+        return [dow, current_hour, weekday, current_quarter, current_dt]
+```
+
+It adds the elapsed minutes to the start date, then reads off the day name (`dow`), a `"weekday"`/`"weekend"` label, the hour and the calendar quarter. The type hint says `int` for the first item but it is really the three-letter day name, such as `'Fri'`. This is the one method with a unit test, in `tests/test_hsm.py`: starting at 09:00 on Friday 1 January 2021, 60 minutes later it expects `['Fri', 10, 'weekday', 1, Timestamp('2021-01-01 10:00:00')]`.
+
+## The arrival generator {#sec-health-service-model-arrivals}
+
+`generate_111_calls` is where the 111 calls are created. First the loop body: one new caller per iteration.
+
+```{.python filename="hsm.py:152-183" code-line-style="dim:2-7,hi:14,hi:17,hi:20,hi:23"}
+    def generate_111_calls(self):
+        """
+        **Patient generator**
+
+        Keeps creating new patients until current time equals sim_duration + warm_up_duration
+
+        """
+
+        if self.env.now < self.sim_duration + self.warm_up_duration :
+            while True:
+                self.patient_counter += 1
+
+                # Create a new caller/patient
+                pt = Caller(self.patient_counter, self.what_if_sim_run)
+
+                # Allocate caller to a GP surgery
+                pt.gp = random.choices(self.GP_surgery_df["gp_surgery_id"], weights=self.GP_surgery_df["prob"])[0]
+
+                # Set caller/patient off on their healthcare journey
+                self.env.process(self.patient_journey(pt))
+
+                # Get current day of week and hour of day
+                [dow, hod, weekday, qtr, current_dt] = self.date_time_of_call(self.start_dt, self.env.now)
+
+                # Update patient instance with time-based values so the current time is known
+                pt.day = dow
+                pt.hour = hod
+                pt.weekday = weekday
+                pt.qtr = qtr
+
+                # This variable is in use, do not comment out!
+                weekday_bool = 1 if weekday == 'weekday' else 0
+```
+
+Each pass through the loop:
+
+1. Creates a `Caller`, which samples its own age, sex and disposition (see [Caller and Call Dispositions](#sec-caller-and-call-dispositions)).
+2. Picks a GP surgery using `random.choices`, weighted by the `prob` column.
+3. Calls `self.env.process(self.patient_journey(pt))`. This does not run the journey now. It registers it with SimPy, which will run it as its own process, interleaved with the generator. The journey itself is [Patient Journey Process](#sec-patient-journey-process).
+4. Asks `date_time_of_call` what the calendar says *now* and stamps the answer onto the caller, so the journey can use the hour, weekday flag and quarter.
+
+Note that the caller is set off *before* its time-based fields are filled in. That is safe because `env.process` only schedules the journey: it will not start until the generator next yields.
+
+Now for the part that decides *when* the next call arrives:
+
+```{.python filename="hsm.py:185-199" code-line-style="hi:6,hi:9,hi:12,hi:15"}
+                # The interarrival times are recorded in a pandas dataframe.
+
+                # TODO - See if the interarrival times can be improved with machine learning
+
+                # Retrieve mean interarrival time for the specific hour, weekday/weekend and yearly quarter
+                inter_time = float(self.call_interarrival_times_lu.query("exit_hour == @hod & weekday == @weekday_bool & qtr == @qtr")["mean_inter_arrival_time"].tolist()[0])
+
+                # Retrieve the maximum interarrival rate for the specific hour, weekday/weekend and yearly quarter
+                max_hourly_interarrival_rate = (60 / (float(self.call_interarrival_times_lu.query("exit_hour == @hod & weekday == @weekday_bool & qtr == @qtr")["max_arrival_rate"].tolist()[0])))
+
+                # Retrieve the minimum interarrival rate for the specific hour, weekday/weekend and yearly quarter
+                min_hourly_interarrival_rate = (60 / (float(self.call_interarrival_times_lu.query("exit_hour == @hod & weekday == @weekday_bool & qtr == @qtr")["min_arrival_rate"].tolist()[0]))) - 1
+
+                # Determine the interarrival time for the next patient by sampling from the exponential distrubution
+                sampled_interarrival = random.expovariate(1.0 / inter_time)
+```
+
+Three queries pull the same row of the lookup table (hour, weekday flag and quarter). `inter_time` is the mean gap in minutes between calls for that slot. The other two values are converted from calls-per-hour into minutes between calls, and are only used by the `max` and `minmax` options. The sample itself comes from `random.expovariate(1.0 / inter_time)`: an exponential distribution, the textbook choice for the gaps between independent random arrivals.
+
+The final block applies the chosen `ia_type` and then pauses the generator:
+
+```{.python filename="hsm.py:201-226" code-line-style="hi:4,hi:8,hi:13,hi:19,hi:26"}
+                # There are a number of user-configurable options to try and improve inter-arrival rate estimation
+                # SPOILER: base is the best!
+
+                if self.ia_type == 'base':
+                    # Use sampled interarrival time with a check to ensure it does not go over 60 minutes
+                    # as this would technically be in the 'next' hour
+                    sampled_interarrival = 59 if sampled_interarrival >= 60 else sampled_interarrival
+                elif self.ia_type == 'max':
+                    # Repeatedly sample until a value that is less than the minimum hourly interarrival rate
+                    # is sampled. In tests, this lead to a large drop in overall patient numbers
+                    while True if sampled_interarrival <= min_hourly_interarrival_rate else False:
+                        sampled_interarrival = random.expovariate(1.0 / inter_time)
+                elif self.ia_type == 'minmax':
+                    # Repeatedly sample until a value that is less than the minimum hourly interarrival rate
+                    # but greater than the maximum hourly interarrival rate is sampled.
+                    # In tests, this also caused a large drop in overall patient numbers
+                    while True if max_hourly_interarrival_rate >= sampled_interarrival <= min_hourly_interarrival_rate else False:
+                        sampled_interarrival = random.expovariate(1.0 / inter_time)
+                elif self.ia_type == 'mean':
+                    # No random sampling at all. Just use the mean interarrival time
+                    # Also resulted in lower than expected patient arrivals compared to real life and the
+                    # exponential distribuation sampling. Turns out Dan was right about the exponential distrubtion...
+                    sampled_interarrival = inter_time
+
+                # Freeze function until interarrival time has elapsed
+                yield self.env.timeout(sampled_interarrival)
+```
+
+| `ia_type` | What it does | Effect noted in the code comments |
+|---|---|---|
+| `base` | Uses the exponential sample, capping it at 59 minutes so the next call stays within the same hour's row | The best option |
+| `max` | Resamples while the value fails a bound derived from the minimum arrival rate | Large drop in patient numbers |
+| `minmax` | As `max`, with a second bound from the maximum arrival rate | Large drop in patient numbers |
+| `mean` | No randomness: always the mean gap | Fewer arrivals than real life |
+
+: The inter-arrival options {#tbl-health-service-model-ia}
+
+The `yield self.env.timeout(...)` on the last line is what hands control back to SimPy. The generator sleeps for `sampled_interarrival` simulated minutes, SimPy runs whatever else is due (callers' journeys), and then wakes the generator for the next caller.
+
+::: {.callout-note collapse="true" title="Refresher: how a Python generator becomes a SimPy process"}
+A function containing `yield` returns a generator object when called, and does nothing until iterated. `env.process(gen)` hands that generator to SimPy, which advances it until it yields an event (here a `timeout`), then resumes it when that event fires. That is why `generate_111_calls` can contain a `while True` loop without hanging the program: it only ever runs until its next `yield`.
+:::
+
+## Running the replication {#sec-health-service-model-run}
+
+`run` ties it together:
+
+```{.python filename="hsm.py:408-419" code-line-style="hi:5,hi:8,hi:11"}
+    def run(self) -> None:
+        """
+            Function to start the simulation. This function is called by the `runSim` function
+        """
+        # Start entity generators
+        self.env.process(self.generate_111_calls())
+
+        # Run simulation
+        self.env.run(until=(self.sim_duration + self.warm_up_duration + G.pt_time_in_sim))
+
+        # Write run results to file
+        self.write_all_results()
+```
+
+Three steps: register the arrival generator, run the clock, write the results. The end time is the important detail. The simulation runs for `sim_duration + warm_up_duration + G.pt_time_in_sim`, not just the first two. The extra `pt_time_in_sim` is the 72-hour follow-up window (4320 minutes). Note that the generator's `while True` never stops by itself. Its `if self.env.now < ...` guard is evaluated only once, at time zero, so new callers keep arriving until `env.run(until=...)` stops the clock. The extra 72 hours therefore means that callers arriving right at the end of the configured duration can still be followed in full, at the price of the generator continuing to produce callers during that tail. The configuration side of this is in [Run Configuration and Orchestration](#sec-run-configuration-and-orchestration).
+
+::: {.callout-warning title="Paper versus code"}
+Two points where the paper and this code differ or leave a gap. The paper presents capacity constraints as a strength of discrete-event simulation, but drops them in the what-if scenario. In this code the five resources are created but never requested, as noted above, so capacity has no effect on any run. The paper also reports that the model overestimated calls, especially overnight, a result the HSMA talk also mentions. The generator's behaviour after the configured end, described above, is a property of this code and is not something the paper discusses.
+:::
+
+@fig-health-service-model-run shows the whole sequence for one replication.
+
+```{mermaid}
+%%| label: fig-health-service-model-run
+%%| fig-cap: "One HSM replication, from runSim to the CSV files"
+sequenceDiagram
+    participant RS as runSim
+    participant H as HSM
+    participant E as simpy Environment
+    participant G as generate_111_calls
+    participant C as Caller
+    participant PJ as patient_journey
+    RS->>H: HSM(run, ..., ia_type)
+    H->>E: simpy.Environment()
+    RS->>H: run()
+    H->>E: process(generate_111_calls())
+    H->>E: run(until=duration+warm-up+72h)
+    E->>G: start
+    G->>C: Caller(patient_counter, what_if)
+    G->>E: process(patient_journey(pt))
+    E->>PJ: start, interleaved with generator
+    G->>E: yield timeout(inter-arrival)
+    E->>G: resume after the gap
+    E-->>H: clock reaches end time
+    H->>H: write_all_results()
+```
+
+## Using it directly {#sec-health-service-model-using}
+
+You do not need the web app to try an `HSM`. This is how `runSim` uses it, and how `tests/test_hsm.py` builds one:
+
+```{.python .illustrative filename="Example usage"}
+from hsm import HSM
+
+# run_number, sim_duration (min), warm_up (min), start date,
+# what_if_sim_run, transition_type, ia_type
+model = HSM(0, 43200, 1440, "2021-01-01 00:00:00", "No", "qtr", "base")
+model.run()
+```
+
+Nothing is returned. The caller sequence happens inside the SimPy environment, and `run` ends by appending the event log and network counts to the CSV paths held in `G` (the baseline paths here, because `what_if_sim_run` is `"No"`).
+
+## Conclusion {#sec-health-service-model-conclusion}
+
+An `HSM` is one replication of the model. Its constructor creates a private `simpy.Environment`, five generously sized resources, a `Transitions` object and the lookup tables. Its `generate_111_calls` process creates a `Caller`, starts a `patient_journey` process for them, and sleeps for an exponentially distributed inter-arrival time whose mean depends on the hour, weekday and quarter, modified by `ia_type`. `run` starts that generator, lets the clock run for the configured time plus the 72-hour follow-up, and writes the results.
+
+Next, in [Caller and Call Dispositions](#sec-caller-and-call-dispositions), we look at what the `Caller` created on every loop iteration actually is, and how its disposition code and GP contact are sampled.

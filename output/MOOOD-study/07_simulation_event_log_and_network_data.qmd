@@ -1,0 +1,302 @@
+# Simulation Event Log and Network Data {#sec-simulation-event-log-and-network-data}
+
+In [Transitions and Time Distributions](#sec-transitions-and-time-distributions) we saw how a caller's next destination, wait and visit duration are sampled. All of that sampling is invisible unless something writes it down. This chapter covers what the model records as it goes, and how those records reach disk as CSV files.
+
+## What the model has to record {#sec-simulation-event-log-and-network-data-motivation}
+
+Take one concrete caller: Index IUC call, then a GP appointment, then the journey ends. The dashboard in [Results Dashboard and Visualisation](#sec-results-dashboard-and-visualisation) needs two different views of that caller:
+
+1. **A timeline**: when was the GP appointment scheduled, when did it start and when did it finish? From this we can work out queue times, durations and volumes by hour.
+2. **A tally of hops**: how many callers went from Index IUC to GP, across the whole run? This feeds the network graph.
+
+Each `HSM` object (the Health Service Model from [Health Service Model](#sec-health-service-model)) therefore owns two pandas data frames: `results_df` (the event log, one row per event) and `network_df` (one row per possible source-target pair, with a weight counting hops). At the end of a replication both are appended to CSV files named in `G`.
+
+The study compared simulated and observed data using hourly call volumes, quarterly counts and caller trajectories (Pilbery et al., 2023), and used network analysis to map service-to-service flows (HSMA talk). The two tables below provide inputs for each kind of comparison: `results_df` for volumes and trajectories, `network_df` for flows. That mapping is this book's own reading, not a claim made by the study.
+
+::: {.column-margin}
+**Event log**: the `results_df` table, with one row each time a caller is scheduled for, starts or completes a service. See the [glossary](glossary.qmd).
+:::
+
+## The event log: `results_df` {#sec-simulation-event-log-and-network-data-event-log}
+
+The empty table is built in `HSM.__init__`, column by column.
+
+```{.python filename="hsm.py:63-80" code-line-style="hi:2-8"}
+        # Create data frame to capture all sim acitivity
+        self.results_df                   = pd.DataFrame()
+        self.results_df["P_ID"]           = []
+        self.results_df["run_number"]     = []
+        self.results_df["activity"]       = []
+        self.results_df["timestamp"]      = []
+        self.results_df["status"]         = []
+        self.results_df["instance_id"]    = []
+        self.results_df["day"]            = []
+        self.results_df["hour"]           = []
+        self.results_df["disposition"]    = []
+        self.results_df["GP"]             = []
+        self.results_df["age"]            = []
+        self.results_df["sex"]            = []
+        self.results_df["pc_outcome"]     = []
+        self.results_df["gp_contact"]     = []
+        self.results_df["avoidable"]      = []
+        self.results_df.set_index("P_ID", inplace=True)
+```
+
+The highlighted columns are the heart of the log: who (`P_ID`), which run, which service (`activity`), when in simulated minutes (`timestamp`), what happened (`status`) and where in the caller's journey (`instance_id`). The remainder describe the caller or the circumstances: day and hour, GP surgery, age, sex, primary care outcome, whether there was timely GP contact, and whether an ED attendance was avoidable. These come from the [Caller](#sec-caller-and-call-dispositions) and from [Transitions](#sec-transitions-and-time-distributions).
+
+::: {.column-margin}
+**P_ID**: in the paper, real callers' journeys were traced through a pseudonymised NHS number (Pilbery et al., 2023). In the simulation, `P_ID` is simply the simulated caller's id.
+:::
+
+::: {.column-margin}
+**Event status**: one of `scheduled`, `start` or `completed`. **Instance id**: a counter giving the order of a caller's interactions. The first pass through the journey loop is 1, so the Index IUC `completed` row and the first `scheduled` row share it (a code comment says Index IUC is 0, but the increment happens before any row is written).
+:::
+
+### Three statuses per visit
+
+A single visit produces up to three rows for the same `P_ID` and `instance_id`:
+
+| status | written when | what the gap to the next row means |
+|---|---|---|
+| `scheduled` | the next destination has been chosen | the wait (queue) time |
+| `start` | the wait has elapsed and the visit begins | the visit duration |
+| `completed` | the visit ends | |
+
+The one exception is the opening Index IUC call, which only gets a `completed` row, written as a one-off in the journey loop. Because every row carries a `timestamp` taken from `env.now`, differences between rows with the same `instance_id` give the queue and activity times without any extra columns.
+
+As an illustration, the caller above (given `P_ID` 42 here) would leave rows like these. The values are made up for the example:
+
+| P_ID | activity | status | timestamp | instance_id |
+|---|---|---|---|---|
+| 42 | Index_IUC | completed | 1500 | 1 |
+| 42 | GP | scheduled | 1500 | 1 |
+| 42 | GP | start | 1637 | 1 |
+| 42 | GP | completed | 1647 | 1 |
+| 42 | End | scheduled | 1647 | 2 |
+
+Here 1637 − 1500 = 137 minutes is the wait for the GP, and 1647 − 1637 = 10 minutes is the visit (the model uses a fixed 10 minutes for GP visits). The `End` row has no `start` or `completed`, because the loop breaks straight after it.
+
+Because the journey loop and `add_patient_result_row` both check the warm-up (see [Why the log writes check the warm-up period twice](#sec-patient-journey-process-warm-up)), an `instance_id` can occasionally appear with only a `completed` row. When computing queue or visit times, keep only the `instance_id` values that have both `start` and `completed` rows (and a `scheduled` row for waits).
+
+### Where rows are added
+
+The rows are written from inside the patient journey, which [Patient Journey Process](#sec-patient-journey-process) described. Here are the relevant parts of the loop.
+
+In the loop (see [Patient Journey Process](#sec-patient-journey-process-loop)), `instance_id` starts at zero outside the loop and is incremented at the top of every iteration, so each pass through the loop (one hop to a new service) shares a single id. The `not_in_warm_up_period` flag is recalculated every iteration, and the later calls are guarded by it.
+
+```{.python filename="hsm.py:299-329" code-line-style="hi:2-3,hi:10-11,hi:19-20,hi:23-24"}
+            if (patient.activity == 'Index_IUC') and not_in_warm_up_period:
+                # As a one-off, capture the completed Index IUC call
+                self.add_patient_result_row('completed', patient, instance_id, ED_urgent)
+
+            # Update current patient activity
+            patient.activity = next_step
+
+            # Prepare data for event being 'scheduled'
+            # The time between this and 'start' will be the queue time
+            # or wait time or time for the patient to have another
+            # interaction with a healthcare service.
+
+            if not_in_warm_up_period:
+                self.add_patient_result_row('scheduled', patient, instance_id, ED_urgent)
+
+            # Consult the wait_time function to find out how long until the next activity
+            wait_time = self.t.wait_time(current_step, patient.activity)
+            yield self.env.timeout(wait_time)
+
+            # Based on current patient activity, need to determine where they go next...
+            if(patient.activity == 'End'):
+                break
+            elif patient.activity == 'ED':
+                ED_urgent = "non_urgent" if self.t.avoidable_ed_admission(patient.pc_outcome, patient.gp_timely_callback) else "urgent"
+                if not_in_warm_up_period:
+                    self.add_patient_result_row('start', patient, instance_id, ED_urgent)
+                yield self.env.process(self.step_visit(patient, instance_id, ED_urgent))
+            else:
+                if not_in_warm_up_period:
+                    self.add_patient_result_row('start', patient, instance_id, ED_urgent)
+                yield self.env.process(self.step_visit(patient, instance_id, ED_urgent))
+```
+
+Notice the order: the row is written with `scheduled` *before* the `yield self.env.timeout(wait_time)`, and `start` *after* it. That is what makes the time between the two rows the wait. The `ED` branch differs only in that `ED_urgent` is worked out first, so the avoidability flag is on the `start` and `completed` rows. For other services it stays at `"not applicable"`. If the next step is `End`, the loop breaks after the `scheduled` row, so there is no `start` or `completed` for it.
+
+The `completed` row comes from `step_visit` (shown in [Patient Journey Process](#sec-patient-journey-process-loop)), which sleeps for the visit duration and then records the row.
+
+### Building and storing a row
+
+All three call sites funnel through `add_patient_result_row`, which gathers a dictionary from the caller and the clock, then hands it on only if the warm-up is over.
+
+```{.python filename="hsm.py:351-386" code-line-style="hi:25-26"}
+    def add_patient_result_row(self, status: str, patient: Caller, instance_id: int, ED_urgent: str) -> None :
+        """
+            Convenience function to create a row of data for the results table
+
+        """
+        results = {
+            "P_ID"        : patient.id,
+            "run_number"  : self.run_number,
+            "activity"    : patient.activity,
+            "timestamp"   : self.env.now,
+            "status"      : status,
+            "instance_id" : instance_id,
+            "hour"        : patient.hour,
+            "day"         : patient.day,
+            "weekday"     : patient.weekday,
+            "qtr"         : patient.qtr,
+            "GP"          : patient.gp,
+            "age"         : patient.age,
+            "sex"         : patient.sex,
+            "pc_outcome"  : patient.pc_outcome,
+            "gp_contact"  : patient.gp_timely_callback,
+            "avoidable"   : ED_urgent
+        }
+
+        if self.env.now > self.warm_up_duration:
+            self.store_patient_results(results)
+
+
+    def store_patient_results(self, results: dict) -> None:
+        """
+            Adds a row of data to the Class' `result_df` dataframe
+        """
+
+        df_dictionary = pd.DataFrame([results])
+
+        self.results_df = pd.concat([self.results_df, df_dictionary], ignore_index=True)
+```
+
+Two details are worth knowing. First, the warm-up check appears twice: the journey loop tests `env.now < warm_up_duration`, and here `add_patient_result_row` tests `env.now > warm_up_duration`. Either way, events during the warm-up are dropped, so the model starts "full" of callers without those early events skewing the results. Second, the dictionary has two keys (`weekday`, `qtr`) that the empty frame in `__init__` never declared, and it has no `disposition` key. Because `pd.concat` unions columns, `weekday` and `qtr` appear in the output, while the declared `disposition` column is simply empty.
+
+::: {.callout-note collapse="true" title="Refresher: why concat per row is slow but acceptable here"}
+`pd.concat` copies the whole frame every time, so appending row by row is quadratic in the number of rows. For a few thousand events per replication that is fine, and it keeps the code very readable. If runs ever grew much larger, collecting dictionaries in a list and building the frame once at the end would be the usual remedy.
+:::
+
+## Network data: `network_df` and `node_lookup` {#sec-simulation-event-log-and-network-data-network}
+
+The event log is detailed but awkward to draw as a graph. For the Cytoscape network the dashboard only needs *how many times* each hop happened, so the model keeps a second, much smaller table.
+
+::: {.column-margin}
+**Node lookup**: the `node_lookup` dictionary that maps service names to the integer ids used in `network_df`. See the [glossary](glossary.qmd).
+:::
+
+```{.python filename="hsm.py:82-100" code-line-style="hi:4-12"}
+        # Create a data frame to capture data to create a network diagram with cytoscape
+        self.network_df                 = self.create_network_df(run_number)
+
+        self.node_lookup = {
+            "999"       : 0,
+            "ED"        : 1,
+            "End"       : 2,
+            "GP"        : 3,
+            "IP"        : 4,
+            "IUC"       : 5,
+            "Index_IUC" : 6
+        }
+
+        self.run_number = run_number
+
+        self.call_interarrival_times_lu = pd.read_csv("csv/inter_arrival_times.csv")
+
+        self.all_results_location = G.all_results_location if what_if_sim_run == 'No' else G.wi_all_results_location
+        self.network_graph_location = G.network_graph_location if what_if_sim_run == 'No' else G.wi_network_graph_location
+```
+
+Seven service names are given integer ids. They match the categories in the paper's Sankey diagram: primary care, ED, 111, 999, inpatient and no further contact (Pilbery et al., 2023), plus the `Index_IUC` starting call. The last two lines also choose the output paths: a normal run uses `G.all_results_location` and `G.network_graph_location`, while a what-if scenario (see [Run Configuration and Orchestration](#sec-run-configuration-and-orchestration)) uses the `wi_` versions so that it cannot mix with the baseline files.
+
+```{.python filename="hsm.py:103-118" code-line-style="hi:11-14"}
+    def create_network_df(self, run_number: int) -> pd.DataFrame:
+        """Create an empty pandas dataframe ready to populate with network analysis data
+
+        **Returns:**
+            Pandas dataframe consisting of all possible combination of healthcare system 'nodes'. There are 6 in total.
+            Column names of dataframes are: source, target, run_number, weight
+
+        """
+        seq05 = np.arange(0, 6, 1, dtype=int) # Numbers from 0 to 5, not 6!
+        all_combinations = list(product(seq05, seq05))
+        index_iuc_combs = list([(6, 0), (6, 1), (6, 2), (6, 3), (6, 4), (6, 5)])
+        df = pd.DataFrame(np.concatenate((all_combinations, index_iuc_combs)), columns=['source','target'])
+        df['run_number'] = run_number
+        df['weight'] = 0
+
+        return df
+```
+
+This builds every pair of nodes 0 to 5 (36 rows), then adds six rows with source 6 (`Index_IUC`) and each of 0 to 5 as target. That is 42 rows, all with weight 0. `Index_IUC` is only ever a source, because a caller never goes *back* to the initial call. The docstring says "6 in total", but with `Index_IUC` there are seven nodes. In short: 7 nodes (0 to 6); every node 0 to 5 can link to every node 0 to 5 (including itself), and node 6 (`Index_IUC`) can link to 0 to 5 only, giving 6 × 6 + 6 = 42 possible edges. Many of these (for example `End` to anything) will simply keep a weight of 0.
+
+Weights are incremented in the journey loop, immediately after the next step is chosen:
+
+```{.python filename="hsm.py:291-296" code-line-style="hi:2-3,hi:6"}
+            # Prepare source and target variables for network dataframe
+            source = next((v for k, v in self.node_lookup.items() if k == current_step), None)
+            target = next((v for k, v in self.node_lookup.items() if k == next_step), None)
+
+            # Update network graph table
+            self.network_df['weight'] = self.network_df.apply(lambda x: x['weight'] + 1 if x['source'] == source and x['target'] == target else x['weight'], axis = 1)
+```
+
+The step names are translated into ids via `node_lookup`, and the one matching row has its weight raised by one. Unlike the event log, this update is **not** guarded by the warm-up flag, so network weights include hops made during warm-up.
+
+::: {.callout-note title="In the study"}
+In the HSMA talk's Sankey, a node name carries a suffix such as 5, meaning the patient's fifth healthcare interaction. The paper's figure shows only "First" to "Fifth" interaction column headings. In this code the suffix is the `instance_id` from the event log (`utilities.py`), so the log and the diagram share one way of counting steps.
+:::
+
+## Writing the CSVs {#sec-simulation-event-log-and-network-data-writing}
+
+At the end of `HSM.run`, once the SimPy clock has reached its limit, everything is written out:
+
+The `run` method (shown in [Health Service Model](#sec-health-service-model-run)) ends with a call to `write_all_results`. It runs the clock for the simulation duration, plus the warm-up, plus the 72-hour follow-up window, so callers who arrive during the configured run can be followed for their full window.
+
+```{.python filename="hsm.py:389-406"}
+    def write_all_results(self) -> None:
+        """
+            Writes the content of `result_df` to a csv file
+        """
+        # https://stackoverflow.com/a/30991707/3650230
+
+        # Check if file exists...if it does, append data, otherwise create a new file with headers matching
+        # the column names of `results_df`
+        if not os.path.isfile(self.all_results_location):
+           self.results_df.to_csv(self.all_results_location, header='column_names')
+        else: # else it exists so append without writing the header
+            self.results_df.to_csv(self.all_results_location, mode='a', header=False)
+
+        # Same as above except this is the network graph data
+        if not os.path.isfile(self.network_graph_location):
+           self.network_df.to_csv(self.network_graph_location, header='column_names', index=False)
+        else: # else it exists so append without writing the header
+            self.network_df.to_csv(self.network_graph_location, mode='a', header=False, index=False)
+```
+
+The pattern is the same for each file: if it does not exist, create it with a header; otherwise append without one. Since the parallel replications from [Run Configuration and Orchestration](#sec-run-configuration-and-orchestration) all use the same paths from `G`, each file ends up holding every run, distinguished by the `run_number` column. That column is what the run-number dropdown in the dashboard filters on. The event log is written with its pandas index, which after the per-row `pd.concat(..., ignore_index=True)` is just a row counter (an unnamed first column in the CSV); `P_ID`, `weekday` and `qtr` end up as the last three columns. The network table is written without its index.
+
+::: {.callout-warning}
+The existence check and the write are not atomic. Runs that finish at almost the same moment could in principle both see "no file" and both write headers. The code relies on runs finishing at different times. The files are cleared by `parallelProcess` (see [Run Configuration and Orchestration](#sec-run-configuration-and-orchestration-parallel)) before each batch of runs; `HSM.run` itself never clears them. If you create an `HSM` directly, its rows are appended to any existing file in `data/`.
+:::
+
+@fig-sim-output-flow summarises the whole path from journey to disk.
+
+```{mermaid}
+%%| label: fig-sim-output-flow
+%%| fig-cap: "From a caller's journey to the two CSV files"
+sequenceDiagram
+    participant PJ as Patient journey
+    participant H as HSM
+    participant EL as results_df
+    participant ND as network_df
+    participant CSV as CSV files in G
+    PJ->>ND: add 1 to weight for source-target
+    PJ->>H: add_patient_result_row(status)
+    H->>H: after warm-up?
+    H->>EL: store_patient_results(row)
+    Note over PJ,EL: repeated for every hop
+    H->>CSV: write_all_results() at end of run
+    EL->>CSV: append rows (header if new)
+    ND->>CSV: append 42 rows (header if new)
+```
+
+## Conclusion {#sec-simulation-event-log-and-network-data-conclusion}
+
+Each replication keeps an event log (`results_df`, three statuses per visit, tied together by `instance_id`, and only after the warm-up) and a small `network_df` of hop counts keyed by the integer ids in `node_lookup`. At the end of `run`, `write_all_results` appends both to the shared CSV paths in `G`, with separate paths for what-if runs.
+
+Next, in [Results Dashboard and Visualisation](#sec-results-dashboard-and-visualisation), we'll see how the results page reads these files and turns them into charts, tables and the network graph.

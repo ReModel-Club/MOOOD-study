@@ -1,0 +1,92 @@
+# The study behind the model {#sec-background .unnumbered}
+
+This book explains a piece of software, but the software only makes sense once you know what question it was built to answer. This page gives that context. It draws on the open-access BMJ Open paper (Pilbery et al., 2023: [doi:10.1136/bmjopen-2023-076203](https://doi.org/10.1136/bmjopen-2023-076203)) and on a conference talk given as part of the Health Service Modelling Associates (HSMA) programme, an NHS training scheme in simulation and data science ([the HSMA conference talk](https://www.youtube.com/watch?v=cg5Bp3O02io)). Where the two disagree, this page follows the paper, because the talk presented early, preliminary results.
+
+## The problem {#sec-background-problem}
+
+NHS 111 is the telephone service for urgent but non-emergency needs. According to the paper, it took over 19 million calls in 2019/20, and about 55% of them ended with a referral to primary care (for example, a GP). That referral usually comes with a time frame: someone should be in touch within a few hours, say.
+
+If that contact does not happen in time, callers may ring 999 or turn up at the emergency department (ED) instead. The talk adds that primary care commissioning has changed little to absorb this demand. The study asks how much of that overflow is real, and what it would take to remove it.
+
+## The questions and the what-if scenario {#sec-background-questions}
+
+The paper sets two objectives. The first is to model the current system for callers whom 111 sends to primary care. The second is to estimate the effect, and the resourcing needed, if every such caller received timely primary care contact.
+
+That second question becomes the **what-if scenario**: every index call with a primary care disposition gets a timely response, and every caller then uses primary care. The paper places no capacity limit on primary care, so the model shows the demand that would arise rather than what could be delivered. In this repository, that scenario is the Yes/No "Run What if? simulation" option (a radio group, defaulting to Yes) that you meet in @sec-dash-application-shell.
+
+## The setting and the data {#sec-background-data}
+
+The cohort is callers registered with a Bradford GP who were triaged to a primary care disposition by one 111 call centre in Yorkshire during 2021 (a pandemic year). The paper reports 56,102 such calls.
+
+The data come from **Connected Yorkshire**, a regional database that links patient-level records for about 1.2 million people in Bradford and Airedale. It covers 111 and 999 calls, primary care, ED and inpatient care. A pseudonymised NHS number and timestamps let the researchers trace every contact within 72 hours of the first call.
+
+## The methods, and where they live in this repo {#sec-background-methods}
+
+The researchers built a conceptual model with ambulance, 111, general practice and ED stakeholders, using soft systems methodology (a structured way of agreeing a shared picture of a messy process with the people involved). Two quantitative methods then turned it into numbers.
+
+- **Network analysis** (done in R, outside this repository) works out how callers move between services, giving the transition probabilities. Those probabilities arrive here as CSV files, which @sec-transitions-and-time-distributions covers.
+- **Discrete event simulation (DES)** follows simulated callers through those services. The paper's model uses SimPy in Python. It draws call arrivals from an exponential distribution whose rate varies by hour, quarter and weekend, and it picks distributions for waiting and activity times with a Python curve-fitting library. The model is in @sec-health-service-model, the caller in @sec-caller-and-call-dispositions and the journey in @sec-patient-journey-process.
+
+The paper also describes a Plotly Dash dashboard so that stakeholders can run their own simulations (@sec-dash-application-shell and @sec-run-configuration-and-orchestration). Its outputs, and the comparison with real data, are in @sec-simulation-event-log-and-network-data and @sec-results-dashboard-and-visualisation.
+
+```{mermaid}
+%%| label: fig-background-services
+%%| fig-cap: "A simplified view of the main routes a caller can take within 72 hours of the index call"
+flowchart LR
+  A[Index 111 call] --> GP[GP]
+  A --> E[ED]
+  A --> N[999]
+  A --> X[No further contact]
+  GP <--> I[111]
+  GP <--> E
+  E --> H[Inpatient]
+  GP --> X
+```
+
+@fig-background-services is a simplification: it omits, for example, the index call's routes to 111 and to inpatient care, and onward moves from 999. In reality, callers can move between most services in both directions, but never back to the index call. A caller leaves the system either by being sampled into "no further contact" (called `End` in the code) or when the 72-hour follow-up limit is reached. Only one such exit is drawn, to keep the diagram readable.
+
+## Key definitions {#sec-background-definitions}
+
+| Term | Meaning |
+|---|---|
+| **IUC** (integrated urgent care) | The NHS umbrella for urgent telephone and related services. 111 is its key part, and the code names the first call `Index_IUC`. |
+| **Index call** | The first 111 call, which enters a caller into the cohort. |
+| **Disposition** | The triage outcome of a 111 call. A primary care disposition refers the caller to a primary care service and sets a time frame. Over 96% went to a GP or out-of-hours GP. |
+| **Timely contact** | A primary care contact within the time frame set by the triage outcome. |
+| **Avoidable ED attendance** | A type 1 ED visit (a consultant-led, 24-hour emergency department) where the patient had no investigation, treatment or referral that needed type 1 facilities (the O'Keeffe et al. criteria). The code uses different names for it, listed in the [glossary](glossary.qmd). |
+| **72-hour window** | The follow-up period for each caller after the index call. |
+| **In-hours / out-of-hours** | The paper gives no hours, but notes that most primary care dispositions arrive out of hours. |
+
+## Headline findings {#sec-background-findings}
+
+These are the paper's mean counts per simulated year, baseline versus what-if.
+
+| Service | Baseline | What-if | Change |
+|---|---|---|---|
+| Primary care | 39,283 | 77,030 | about +96% |
+| 999 | 2,042 | 1,593 | about -22% |
+| 111 | 4,789 | 3,074 | about -36% |
+| ED | 9,337 | 8,228 | about -12% |
+| Inpatient | 4,668 | 4,620 | about -1% |
+
+The change column is recomputed from the counts. The paper's abstract and Table 1 print "% change" figures such as 78.0% and 88.1%, but these are the what-if count as a percentage of baseline (for example 78.0% for 999), so 78.0% means a 22% fall, not a rise to 78%.
+
+Two points stand out. Primary care would need to nearly double. And avoidable ED attendances fell by only 26 on average, but total ED attendances fell by more, so the avoidable share actually rose slightly (about 12% to 13.3%). The authors conclude that the scenario is probably impractical, given staff shortages and the difficulty of changing caller behaviour.
+
+The paper's limitations include black-box validation only (checking that outputs match real data, not the internal steps), a single region during the pandemic, no age, sex or clinical detail, and missing pharmacy, mental health and optician contacts. The talk's early figures differ from the paper's (for example, it suggested ED attendance might rise), and the paper supersedes them.
+
+## How the code differs from the paper {#sec-background-differences}
+
+This repository is the code the paper points to, but a reader of the code will notice some differences. In each case the code is what runs.
+
+- **Runs and duration.** The paper used 100 runs of one year. The code defaults to three runs; its global default duration is 96 hours and the app form's default is seven days, though the form allows up to 100 runs and 365 days (@sec-run-configuration-and-orchestration). The code also has a warm-up period, which the paper does not mention.
+- **Capacity.** The paper presents capacity limits as a strength of DES and drops them for the what-if. In the code, no resource is ever requested in either scenario (@sec-health-service-model).
+- **Timely contact.** In the code, "timely" is a flag set when a caller is created. In the what-if it is forced on, but the wait before the GP contact is still sampled, not bounded by the disposition's time frame (@sec-caller-and-call-dispositions and @sec-patient-journey-process).
+- **The 72-hour limit.** The check runs at the top of the journey loop, so a final wait or visit can run past 72 hours (@sec-patient-journey-process).
+- **Activity times.** The paper fits a distribution per service. The code uses a fixed 10 minutes for GP visits and separate urgent and non-urgent ED distributions (@sec-transitions-and-time-distributions).
+- **Extra routing options.** Alternative routing and arrival options in the code are not in the paper (@sec-transitions-and-time-distributions and @sec-health-service-model).
+
+## Further reading {#sec-background-reading}
+
+- Pilbery R, Smith M, Green J, Chalk D, O'Keeffe CA. Modelling NHS England 111 demand for primary care services: a discrete event simulation. *BMJ Open* 2023;13:e076203. <https://doi.org/10.1136/bmjopen-2023-076203>. Open access (CC BY 4.0).
+- The HSMA conference talk: <https://www.youtube.com/watch?v=cg5Bp3O02io>. It shows early results, which the speaker called tentative.
