@@ -1,0 +1,283 @@
+# Results Dashboard and Visualisation {#sec-results-dashboard-and-visualisation}
+
+In [Simulation Event Log and Network Data](#sec-simulation-event-log-and-network-data) we saw how each replication writes an event log and a network edge list to CSV files under `data/`. Those files are only raw material. This chapter covers the other end of the pipeline: the Dash callbacks in `callbacks.py` and the helpers in `utilities.py` that turn those files into the charts, tables and graphs on the results page.
+
+## The use case: choosing a run and watching the page redraw {#sec-results-dashboard-and-visualisation-use-case}
+
+Imagine you have just finished a simulation with five replications and opened the results page. At the top is a dropdown. By default it shows "Average (mean) of all runs". You switch it to run 3. Within a moment, the summary percentages, the call-volume histograms, the Sankey diagram, the network graph and most of the simulated tables all change to show only run 3. (The observed panels do not change, and a few what-if panels have quirks; see the warning near the end of the chapter.)
+
+That one interaction is the whole chapter. The dropdown is the single shared `Input` for almost every results callback, and each callback independently re-reads the CSVs and redraws its own output. There is no shared "results object" in memory. The CSV files are the shared state.
+
+::: {.column-margin}
+**Run-number dropdown**: the `dropdown-run-number` component on the results page. Its value is the zero-based run index, or `999` meaning "mean over all runs".
+:::
+
+::: {.column-margin}
+**Sankey diagram**: a flow diagram where the width of each band is proportional to the number of patients moving between two nodes. Here the nodes are services at successive steps of a patient journey, such as `GP_2`.
+:::
+
+::: {.column-margin}
+**Connected Yorkshire data**: observed reference data from a regional health-record linkage programme, used as the real-world benchmark for the 111 service, stored as `csv/cb_*.csv` and plotted beside the simulation output. In the code it is tagged `cYorkshire2021` or prefixed `cb_`. The BMJ Open paper (Pilbery et al., 2023) describes Connected Yorkshire as a database of linked patient-level records, covering about 1.2 million people in Bradford and Airedale, across 111 and 999 calls, primary care, ED and inpatient care.
+:::
+
+## Key concepts {#sec-results-dashboard-and-visualisation-concepts}
+
+**The `999` convention.** Run numbers in the event log start at 0, so the code needs a value that cannot be a real run. It uses `999` for "all runs, averaged". Almost every callback and helper branches on `run_number == 999` or `run_number < 999`.
+
+**Two sources of data.** Simulation output comes from the paths held in `G` (see [Run Configuration and Orchestration](#sec-run-configuration-and-orchestration)), such as `G.all_results_location` and `G.network_graph_location`. The observed data comes from `csv/cb_*.csv`, whose paths are also on `G`:
+
+| `G` attribute | File | Used for |
+|---|---|---|
+| `cb_node_list` | `csv/cb_node_list.csv` | node ids and labels for the graph and summary stats |
+| `cb_sankey_data` | `csv/cb_sankey.csv` | the observed Sankey diagram |
+| `cb_111_call_volumes` | `csv/cb_111_call_volumes.csv` | observed call volume by day and hour |
+| `cb_quarterly_counts` | `csv/cb_quarterly_counts.csv` | observed counts per service per quarter |
+| `cb_ed_attedance_volumes` | `csv/cb_ed_attendance_volumes.csv` | observed ED attendance volume |
+
+(The attribute name `cb_ed_attedance_volumes` is misspelt in the source; the code consistently uses that spelling.)
+
+::: {.callout-note title="In the study"}
+The observed panels reproduce the validation comparison in the BMJ Open paper (Pilbery et al., 2023): hourly call volumes, quarterly contacts per service and Sankey diagrams. The paper used observed 2021 records for callers registered with a Bradford GP, and reports 56,102 index calls. It reports the simulated first contacts as 47.5% to a GP and 38.9% to no further contact.
+
+In this repository, the reference data agree with the paper's observed figures: the edges leaving the index call (node `6`) in `csv/transition_probs_gp_added.csv` sum to 56,102, with 47.6% going to a GP and 38.8% to `End` (no further contact). A healthy run should land close to those observed shares. For the wider picture, see [The study behind the model](background.qmd).
+:::
+
+**What-if beside baseline.** If the run was a what-if scenario (see [Run Configuration and Orchestration](#sec-run-configuration-and-orchestration)), a second set of files with a `wi_` prefix exists, and many callbacks load it too and show it next to the baseline.
+
+**Settings come from the browser.** Callbacks never receive the what-if flag or number of runs directly from the form. They read them as `State` from the `dcc.Store` components described in [Dash Application Shell](#sec-dash-application-shell), such as `what_if_sim_run_store` and `store-num-runs`.
+
+## Populating the dropdown {#sec-results-dashboard-and-visualisation-dropdown}
+
+The dropdown's options are built when the page loads, from the stored number of runs.
+
+```{.python filename="callbacks.py:222-242" code-line-style="hi:11-14"}
+# Populate age dropdown based on the number of runs available
+@app.callback(
+    Output('dropdown-run-number', 'options'),
+    Output('dropdown-run-number', 'value'),
+    Input('url', 'pathname'),
+    State('store-num-runs', 'data'),
+)
+def dropdown_run_number(url, num_runs):
+    print('Dropdown run number')
+
+    if num_runs is None:
+        num_runs = 1
+    else:
+        num_runs = int(num_runs)
+
+    keys = list(range(0,num_runs))
+    thelist = [{'label': 'Average (mean) of all runs', 'value': 999}]
+    for i in keys:
+        thelist.append({'label':i+1, 'value':i})
+
+    return thelist, 999
+```
+
+The trigger is the URL pathname, so the list is rebuilt whenever the user navigates to a page. The highlighted lines show the labelling rule: people see runs numbered from 1, but the underlying `value` is the zero-based index. That is why some titles elsewhere print `run_number + 1`. The callback also resets the selection to `999` each time.
+
+## Summary statistics {#sec-results-dashboard-and-visualisation-summary-stats}
+
+The "Outcome" tab shows what proportion of first contacts went to each service (GP, ED, 999, IUC, none), for the simulation, the what-if scenario and the observed data. The callback `summary_stat_page_content` has about thirty `Output`s, one per text box, and simply delegates the arithmetic to `summary_stats` in `utilities.py`:
+
+```{.python filename="callbacks.py:145-147"}
+def summary_stat_page_content(run_number, sim_start_date, sim_duration, warm_up_time, number_of_runs, what_if_sim_run, transition_type, ia_time):
+    values_dict = summary_stats(what_if_sim_run, run_number)
+    # print(values_dict.keys())
+```
+
+`summary_stats` works from the network edge list written by the model (see [Simulation Event Log and Network Data](#sec-simulation-event-log-and-network-data)). Node `6` is the index 111 call, so edges whose `source` is 6 are the first contacts:
+
+```{.python filename="utilities.py:57-72" code-line-style="hi:7-8,hi:12-13"}
+def summary_stats(what_if_sim_run, run_number = 999):
+    print(f"What is sim sun is : {what_if_sim_run}")
+    nodeData = pd.read_csv(G.cb_node_list, low_memory=False)
+    cbEdgeData = pd.read_csv(G.transition_probs_gp_added)
+    edgeData = pd.read_csv(G.network_graph_location, low_memory=False, index_col=False)
+
+    cbdata = cbEdgeData[cbEdgeData['source'] == 6]
+    data = edgeData[edgeData['source'] == 6]
+    if run_number != 999:
+        data = data[data['run_number'] == run_number]
+
+    cbdata2 = pd.merge(cbdata[['target', 'weight']], nodeData, left_on='target', right_on='ID', how='left')
+    data2 = pd.merge(data[['target', 'run_number', 'weight']], nodeData, left_on='target', right_on='ID', how='left')
+    cbtotal = cbdata2['weight'].sum()
+    total = data2['weight'].sum()
+    num_runs = data2['run_number'].nunique()
+```
+
+The highlighted lines pick out first contacts, narrowing to one run if one was chosen. The two merges then attach human-readable labels from `cb_node_list.csv`. The simulation total is later divided by `num_runs`, so with `999` the figure is a per-run mean. Note that for the observed data the edge list is `G.transition_probs_gp_added`, not a `cb_` file. For each label the function then computes `weight / total * 100`, rounded to one decimal place, and returns everything in one dictionary keyed by `GP`, `cb_GP`, `wi_GP` and so on.
+
+Back in the callback, if the what-if flag is `'No'` the `wi_*` values are set to `None` and the what-if boxes are hidden with `{'display':'none'}`. That is how "what-if results are shown beside baseline results when present" is implemented.
+
+## The network graph {#sec-results-dashboard-and-visualisation-network}
+
+The graph is a Cytoscape component. Its callback is very short:
+
+```{.python filename="callbacks.py:329-338"}
+# Show network graph
+@app.callback(
+    Output('network-graph', 'elements'),
+    Input('dropdown-run-number', 'value'),
+    State('what_if_sim_run_store', 'data')
+)
+def network_graph_draw(run_number, what_if_sim_run):
+    elements = create_cyto_graph(what_if_sim_run, run_number)
+
+    return elements
+```
+
+::: {.column-margin}
+**Cytoscape network graph**: an interactive node-and-edge diagram (`dash_cytoscape`). It takes one flat list of `elements`, each a dictionary with a `data` key.
+:::
+
+`create_cyto_graph` reads the node lookup and the edge list, then collapses or filters the edges depending on the dropdown:
+
+```{.python filename="utilities.py:14-27"}
+    if run_number == 999:
+        edgeData2 = edgeData.groupby(['source', 'target'], as_index=False).agg(weight = pd.NamedAgg(column='weight', aggfunc='mean'))
+        # Add run_number column back in to avoid errors
+        edgeData2.insert(2, 'run_number', 9999999)
+        edgeData2['weight'] = edgeData2['weight'].round(0)
+        edgeData2 = edgeData2[edgeData2['weight'] > 0]
+        #print(edgeData2.head())
+    else:
+        edgeData2 = edgeData[edgeData['run_number'] == run_number].copy()
+        #print(edgeData2.head())
+        edgeData2['weight'] = edgeData2['weight'].round(0)
+        #print(edgeData2.head())
+        edgeData2 = edgeData2[edgeData2['weight'] > 0]
+        #print(edgeData2.head())
+```
+
+For the mean, edge weights are averaged across runs per `(source, target)` pair. A placeholder `run_number` column is inserted so that the column positions stay the same as in the single-run case, because the code afterwards reads columns by position (`iloc[j,3]` for weight). In both branches, edges that round to zero are dropped so the graph is not cluttered. The function then builds one node dictionary per row of the node lookup (`{"data": {"id": ..., "label": ...}}`) and one edge dictionary per remaining edge, and returns `nodes_list + edges_list`.
+
+A separate callback, `downloadNetworkAnalysis`, sends `data/network_graph.csv` (or the `wi_` file for what-if runs) to the browser with `dcc.send_file`, so users can analyse the graph elsewhere.
+
+## The Sankey diagram {#sec-results-dashboard-and-visualisation-sankey}
+
+The page shows three Sankey diagrams: simulated, what-if and observed. One callback produces all three:
+
+```{.python filename="callbacks.py:349-366"}
+def sankey(what_if_sim_run, run_number = 999):
+    # TODO: Handle case when there is no CSV file yet
+    df = pd.read_csv('data/all_results.csv', low_memory=False)
+
+    # TODO: Probably need to do something more graceful than just set to df
+    wi_df = pd.read_csv(G.wi_all_results_location) if exists(G.wi_all_results_location) else df
+
+    if run_number < 999:
+        df = df[df['run_number'] == run_number]
+
+    sorted_labels, colorList, short_name, source_numbers, target_numbers, counts2 = prep_draw_Sankey(df, run_number)
+    wi_sorted_labels, wi_colorList, wi_short_name, wi_source_numbers, wi_target_numbers, wi_counts2 = prep_draw_Sankey(wi_df, run_number)
+
+    return [
+        draw_Sankey(sorted_labels, colorList, short_name, source_numbers, target_numbers, counts2),
+        draw_Sankey(wi_sorted_labels, wi_colorList, wi_short_name, wi_source_numbers, wi_target_numbers, wi_counts2 ),
+        draw_CB_Sankey()
+    ]
+```
+
+Two things are worth noticing. First, if no what-if file exists, the baseline data frame stands in for it, so the what-if panel just duplicates the baseline (the `TODO` admits this is not graceful). Second, the work is split in two: `prep_draw_Sankey` turns the event log into plain lists, and `draw_Sankey` turns those lists into a Plotly figure. The observed diagram skips the prep step, because `csv/cb_sankey.csv` is already stored as `source`, `target`, `counts2` rows, and `draw_CB_Sankey` simply reuses `draw_Sankey`.
+
+The interesting part is `prep_draw_Sankey`. It starts from the event log, uses only `start` events plus the `Index_IUC` and `End` rows, and builds a node name from the activity and the instance id (see [Simulation Event Log and Network Data](#sec-simulation-event-log-and-network-data) for what the instance id counts):
+
+```{.python filename="utilities.py:205-216" code-line-style="hi:1-3,hi:6-7"}
+def prep_draw_Sankey(df, run_number):
+    df1 = df[(df['activity'].isin(['End', 'Index_IUC'])) | (df['status'] == 'start')]
+    df2 = df1[['P_ID','run_number','activity','instance_id','timestamp']].copy()
+    df2['name'] = df2['activity'] + '_' + df2['instance_id'].astype(str).str[:-2]
+
+
+    df2["source"]=df2.sort_values(['run_number', 'P_ID', 'timestamp']).groupby(['run_number','P_ID'])["name"].shift(1)
+    df2['target']=df2.name
+
+    df2a = using_nth(df2)
+
+    df3 = df2a[['source','target']][df2a['source'] != 'End_1'].dropna().value_counts().to_frame('counts').reset_index()
+```
+
+Each patient's events are sorted by time and then shifted by one row within the patient, so every event's `source` is the previous event's name and its `target` is its own. Counting identical `(source, target)` pairs gives the band widths. The helper `using_nth` removes each patient's first row, which has no predecessor. After that the function maps each label to an integer position (Plotly's Sankey wants indices, not names), picks a colour per service, and, when `run_number == 999`, divides every count by the number of runs so the mean flow is shown.
+
+## Volume charts, quarterly counts and tables {#sec-results-dashboard-and-visualisation-volumes-tables}
+
+The remaining callbacks follow the same recipe: read observed CSV, read simulation CSV, tidy both, draw. Which callback draws what:
+
+| Callback | Draws | Data source |
+|---|---|---|
+| `fig_call_vol` | 111 call volumes by day and hour | observed |
+| `sim_fig_call_vol` | the same, for the model | simulation |
+| `ed_attend_vol` | ED attendances by day and hour | observed |
+| `sim_ed_attend_vol` | the same, for the model | simulation |
+| `fig_qtr_counts` | quarterly counts per service | observed and simulation |
+| `fig_qtr_tab_counts` | the same counts as a table | observed and simulation |
+| `avoid_adm_tab_counts` (two) | avoidable-admission tables (counts, proportions) | observed and simulation |
+
+- `fig_call_vol` and `sim_fig_call_vol` draw observed and simulated 111 call volumes by day and hour with `vol_fig`. The simulated one filters the event log to `activity == 'Index_IUC'`.
+- `ed_attend_vol` and `sim_ed_attend_vol` do the same for ED attendances, using `start` events at the `ED` activity.
+- `fig_qtr_counts` and `fig_qtr_tab_counts` compare quarterly counts per service. Both call `quarterly_counts`, which produces a mean and a 95% confidence interval across replications:
+
+```{.python filename="utilities.py:136-140"}
+    sim_data5 = sim_data4.groupby(['quarter','activity'], as_index=False)['count'].agg(['mean', 'sem']).reset_index()
+    sim_data5['Upper_95_CI'] = round(sim_data5['mean'] + 1.96* sim_data5['sem'],1)
+    sim_data5['Lower_95_CI'] = round(sim_data5['mean'] - 1.96* sim_data5['sem'],1)
+    sim_data5['data'] = sim_data_type
+    sim_data5['count'] = sim_data5['mean'].map(lambda x: round(x)) # Alternative method to round, but not necessary
+```
+
+The counts per replication have already been produced; here they are averaged across replications, and the standard error of the mean (`sem`) gives the interval as mean plus or minus 1.96 standard errors. This is the same kind of 95% interval around a mean that the paper reports (the paper does not state its exact method). The `data` column is a label ("Simulation", "What if" or the observed `cYorkshire2021`), and it is what lets `fig_qtr_counts` concatenate all three sources into one frame and colour the bars by `data`.
+
+The tables use the same trick. `fig_qtr_tab_counts` builds a `combo` column that is the plain count for observed data and `mean (lower-upper)` text for simulated data, then pivots on `data` so each source becomes a column of a Dash `DataTable` with CSV export. The two avoidable-admission callbacks hand the work to `prep_admissions_table` with `type='count'` or `type='prop'`. It follows the same concatenate, build `combo`, pivot pattern, using `avoidable_admission_count` and the avoidable ED attendance flag produced in [Transitions and Time Distributions](#sec-transitions-and-time-distributions).
+
+::: {.callout-note collapse="true" title="Refresher: how Dash decides when a callback runs"}
+A Dash callback runs whenever any of its `Input` properties changes. `State` properties are read at that moment but never trigger a run. That is why `what_if_sim_run_store` is declared as `State` everywhere: changing the stored setting alone should not redraw anything, but the dropdown should.
+:::
+
+## Under the hood {#sec-results-dashboard-and-visualisation-internals}
+
+@fig-results-dashboard-and-visualisation-flow shows what happens when the user picks run 3 in the dropdown. Only one callback is shown, but every results callback behaves the same way.
+
+```{mermaid}
+%%| label: fig-results-dashboard-and-visualisation-flow
+%%| fig-cap: "One dropdown change redraws a results chart"
+sequenceDiagram
+  participant U as User
+  participant D as Dropdown
+  participant CB as Callback
+  participant UT as utilities.py
+  participant F as CSV files
+  U->>D: choose run 3
+  D->>CB: value = 2
+  CB->>UT: helper(what_if, 2)
+  UT->>F: read all_results / network_graph
+  UT->>F: read csv/cb_*.csv
+  F-->>UT: data frames
+  UT-->>CB: figure, elements or table
+  CB-->>U: component redrawn
+```
+
+Step by step:
+
+1. The dropdown value becomes `2` (run 3, zero-based) and Dash fires every callback that lists `dropdown-run-number` as an `Input`.
+2. Each callback reads the stored what-if flag as `State`.
+3. Each callback (directly or via a helper in `utilities.py`) reads CSV files with `pandas.read_csv`. Paths come from the `G` class, never hard-coded, with two exceptions: `sankey` opens `'data/all_results.csv'` as a literal string, and `downloadNetworkAnalysis` hard-codes `./data/network_graph.csv` and `./data/wi_network_graph.csv`.
+4. The simulation data is filtered to run 2, or aggregated across runs when the value is `999`. The observed data is unaffected by the dropdown.
+5. Observed Connected Yorkshire data is combined or placed alongside, and the result is returned as a Plotly figure, Cytoscape elements, a `DataTable` or a list of numbers.
+
+::: {.callout-warning title="Things to know before changing this code"}
+- The what-if panels are only meaningful against the paper's scenario: every index call with a primary care disposition gets timely contact. The paper's Table 1 means are 39,283 baseline against 77,030 what-if primary care contacts, and 9,337 against 8,228 ED attendances. Avoidable ED attendances fell by only 26 on average, so do not expect the what-if charts to show a large drop there.
+- Because every callback re-reads its CSVs from disk, a result page opened before any simulation has run will fail. Many callbacks carry a `# TODO: Handle case when there is no CSV file yet`.
+- `callbacks.py` defines a `fig_age_dist` callback targeting a component with id `age-dist`, but no layout contains that id, so it never renders anywhere (Dash does not complain because `suppress_callback_exceptions=True`). `figures.py` holds an older copy of the same function that refers to an undefined `df` and is never imported, so it is dead code too.
+- `sim_fig_call_vol` and `sim_ed_attend_vol` compute `run_number + 1` for the title before testing `run_number is None`. If the dropdown value is ever `None`, they would raise a `TypeError` and the `None` handling below never runs. Move the title line below the check.
+- When a single run is chosen, the what-if Sankey (`sankey`) leaves the what-if data unfiltered, and the quarterly-count table and avoidable-admission tables mistakenly use the baseline frame in place of the what-if frame.
+- Two avoidable-admission callbacks are both named `avoid_adm_tab_counts`; the second definition shadows the name, though Dash has already registered both callbacks.
+:::
+
+## Conclusion {#sec-results-dashboard-and-visualisation-conclusion}
+
+The results page is a set of small, independent callbacks keyed on one dropdown. Each reads the CSVs the model wrote, aggregates them either for a single run or as a mean (`999`), sets them beside the observed Connected Yorkshire data and returns a figure, a graph, a table or a handful of numbers. The heavy lifting sits in `utilities.py`: `summary_stats`, `create_cyto_graph`, `prep_draw_Sankey` and `draw_Sankey`, `vol_fig`, `quarterly_counts` and `prep_admissions_table`.
+
+That completes the tour of the MOOOD-study codebase, from the Dash shell in [Dash Application Shell](#sec-dash-application-shell), through the SimPy model and its data, to the charts at the end. If a term has slipped your mind, the [Glossary](glossary.qmd) collects them all in one place. 
+End to end: the form ([Dash Application Shell](#sec-dash-application-shell)) feeds `configSim` ([Run Configuration and Orchestration](#sec-run-configuration-and-orchestration)), which starts one `HSM` per replication ([Health Service Model](#sec-health-service-model)). Each `HSM` creates `Caller`s ([Caller and Call Dispositions](#sec-caller-and-call-dispositions)) and runs a journey process for each ([Patient Journey Process](#sec-patient-journey-process)), sampling with `Transitions` ([Transitions and Time Distributions](#sec-transitions-and-time-distributions)) and logging to CSV ([Simulation Event Log and Network Data](#sec-simulation-event-log-and-network-data)). The results page re-reads those files. Good luck with your own experiments.

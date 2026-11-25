@@ -1,0 +1,497 @@
+project_name: MOOOD-study
+summary: '**MOOOD-study** is a *discrete-event simulation* (built on **SimPy**) of people who call
+
+  the NHS 111 service and are triaged to a *primary care disposition*. Each simulated
+
+  **caller** is followed for 72 hours after the index 111 call while the model samples
+
+  their onward contacts with GP, 111, 999, emergency department (ED) and inpatient services
+
+  from **empirical transition probabilities** and **fitted time distributions** loaded from
+
+  the `csv/` folder. Several independent replications run in parallel with
+
+  `multiprocessing`, and each writes an **event log** and **network edge counts** to CSV.
+
+  A **Plotly Dash** web front end lets users configure a run (duration, warm-up, number of
+
+  runs, a *what-if* scenario in which every caller gets timely GP contact, and alternative
+
+  transition and arrival methods), launch it as a long callback, and compare the simulated
+
+  results with observed *Connected Yorkshire* data through charts, Sankey diagrams, tables
+
+  and a Cytoscape network graph.
+
+  '
+abstractions:
+- id: dash_app_shell
+  name: Dash Application Shell
+  description: 'The web front end is a multi-page Plotly Dash application. `app.py` creates the
+
+    `Dash` instance with Bootstrap themes and a `DiskcacheLongCallbackManager`, configures
+
+    logging and exposes `server` for gunicorn. `index.py` is the entry point: it sets
+
+    `app.layout` (navigation bar, page container, footer and a set of `dcc.Store`
+
+    components that persist run settings in browser local storage) and routes URL paths to
+
+    three page layouts via `display_page`. `homepage.py` holds the landing page,
+
+    `simulation.py` the configuration form (date picker, sliders, radio items and the Run
+
+    button) and `results.py` the results page with a run-number dropdown and tabs.
+
+    `layouts.py` supplies shared style dictionaries and builders for the nav bar, footer,
+
+    summary cards and tab contents.
+
+    '
+  files:
+  - index.py
+  - app.py
+  - layouts.py
+  - homepage.py
+  - simulation.py
+  - results.py
+  - Dockerfile
+  - additional_documentation/bmj_open_paper.pdf
+  - additional_documentation/youtube_transcript.md
+  key_symbols:
+  - app
+  - server
+  - long_callback_manager
+  - display_page
+  - nav_bar
+  - footer
+  - summary_dash
+  - tab_outcome_content
+  - tab_calldata_content
+  - tab_ed_content
+  - render_tab
+  - simulation
+  - results
+  - home
+  tests: []
+- id: run_orchestration
+  name: Run Configuration and Orchestration
+  description: 'Simulation settings flow from the configuration page into the model through three
+
+    pieces. Class `G` in `g.py` holds global defaults (start date, durations in minutes,
+
+    number of runs, resource capacities, the 4320-minute follow-up window) and the paths
+
+    of every input and output CSV. In `callbacks.py`, the long callback `configSim`
+
+    converts the form values (days to minutes, date to a timestamp string) and calls
+
+    `prepStartingVars`, which overwrites module-level globals in `oneoneonedes.py`; a
+
+    companion callback `save_to_local_storage` copies the same values to `dcc.Store`.
+
+    `parallelProcess` then deletes previous output files and uses a `multiprocessing.Pool`
+
+    to call `runSim` once per replication; `runSim` builds and runs an `HSM`, and runs a
+
+    second baseline `HSM` when the what-if option is set.
+
+    '
+  files:
+  - g.py
+  - oneoneonedes.py
+  - callbacks.py
+  - additional_documentation/bmj_open_paper.pdf
+  - additional_documentation/youtube_transcript.md
+  key_symbols:
+  - G
+  - G.pt_time_in_sim
+  - G.all_results_location
+  - G.wi_all_results_location
+  - configSim
+  - save_to_local_storage
+  - prepStartingVars
+  - parallelProcess
+  - runSim
+  tests: []
+- id: hsm_model
+  name: Health Service Model
+  description: '`HSM` in `hsm.py` is the simulation model for one replication. Its constructor creates
+
+    a `simpy.Environment`, five `simpy.PriorityResource` objects (GP, ED, 111, 999,
+
+    inpatient) with very large capacities, a `Transitions` instance for the chosen
+
+    transition type, empty results and network data frames, and lookup tables for GP
+
+    surgeries and call inter-arrival times. `generate_111_calls` is the arrival
+
+    generator: it creates a `Caller`, assigns a GP surgery, starts its journey process,
+
+    derives day, hour, weekday flag and quarter with `date_time_of_call`, and samples the
+
+    next inter-arrival time from an exponential distribution whose mean depends on hour,
+
+    weekday and quarter, adjusted according to `ia_type` (base, max, minmax, mean). `run`
+
+    starts the generator, runs until sim duration plus warm-up plus follow-up, and writes
+
+    results.
+
+    '
+  files:
+  - hsm.py
+  - csv/inter_arrival_times.csv
+  - csv/gp_surgeries.csv
+  - additional_documentation/bmj_open_paper.pdf
+  - additional_documentation/youtube_transcript.md
+  key_symbols:
+  - HSM
+  - HSM.__init__
+  - HSM.run
+  - HSM.generate_111_calls
+  - HSM.date_time_of_call
+  - HSM.env
+  - ia_type
+  tests:
+  - tests/test_hsm.py
+- id: caller_entity
+  name: Caller and Call Dispositions
+  description: '`Caller` in `caller.py` is the simulation entity representing one person who made an
+
+    index 111 call. On construction it samples an age from a beta distribution and a sex
+
+    from `G.prob_male`, sets the starting activity to `Index_IUC`, and draws a 111
+
+    disposition code (Dx05 to Dx75) weighted by the probabilities in
+
+    `CallDispositions.dx_codes`. The disposition maps to a primary care outcome such as
+
+    `contact_2` or `speak_6`. Using `csv/gp_contact_in_timeframe.csv`, it then decides
+
+    whether the caller receives timely GP contact; in what-if runs this is always "yes".
+
+    The object also carries mutable state updated during the journey: current activity,
+
+    timer, hour, day, quarter, weekday flag, GP surgery and last step.
+
+    '
+  files:
+  - caller.py
+  - call_dispositions.py
+  - csv/gp_contact_in_timeframe.csv
+  - additional_documentation/bmj_open_paper.pdf
+  - additional_documentation/youtube_transcript.md
+  key_symbols:
+  - Caller
+  - Caller.disposition
+  - Caller.pc_outcome
+  - Caller.gp_timely_callback
+  - Caller.activity
+  - Caller.timer
+  - CallDispositions
+  - CallDispositions.dx_codes
+  - CallDispositions.gp_timely_contact
+  tests: []
+- id: patient_journey
+  name: Patient Journey Process
+  description: '`HSM.patient_journey` is the SimPy generator process that moves one `Caller` through
+
+    the healthcare system. It loops while the caller''s elapsed time is below
+
+    `G.pt_time_in_sim` (72 hours). Each iteration chooses the next activity, either with
+
+    `Transitions.next_destination` (the default) or with the decision-tree option
+
+    `next_destination_tree`, which uses the `ooh` in-hours check; in what-if runs the
+
+    first step after the index call is forced to GP. It increments the network edge
+
+    count, records "scheduled" and "start" events, yields a sampled wait time, decides
+
+    whether an ED attendance is avoidable, and yields to `step_visit` for the activity
+
+    duration. The loop ends at `End`. Events are not recorded during the warm-up period.
+
+    '
+  files:
+  - hsm.py
+  - additional_documentation/bmj_open_paper.pdf
+  - additional_documentation/youtube_transcript.md
+  key_symbols:
+  - HSM.patient_journey
+  - HSM.step_visit
+  - HSM.ooh
+  - not_in_warm_up_period
+  - instance_id
+  - G.pt_time_in_sim
+  tests: []
+- id: transitions
+  name: Transitions and Time Distributions
+  description: '`Transitions` in `transitions.py` supplies all stochastic routing and timing used by a
+
+    patient journey. Its constructor loads transition probabilities (with or without
+
+    yearly quarters, depending on `transition_type`), a pickled decision-tree model, the
+
+    avoidable-ED-admission table, and queue-time and activity-time distribution
+
+    specifications stored as Python literals in `csv/*.txt`. `next_destination` samples
+
+    the next service from rows matching the current step (and quarter), weighted by
+
+    `ProbGPYes` or `ProbGPNo`. `wait_time` and `activity_time` find a named
+
+    `scipy.stats` distribution and its parameters via `distribution_finder` and resample
+
+    until a positive value is drawn. `avoidable_ed_admission` decides whether an ED visit
+
+    is non-urgent.
+
+    '
+  files:
+  - transitions.py
+  - csv/transition_probs_gp_added.csv
+  - csv/transition_probs_gp_added_no_quarters.csv
+  - csv/queue_time_distributions.txt
+  - csv/activity_time_distributions.txt
+  - csv/avoidable_admission_by_PC_outcome_GP_contact.csv
+  - additional_documentation/bmj_open_paper.pdf
+  - additional_documentation/youtube_transcript.md
+  key_symbols:
+  - Transitions
+  - Transitions.next_destination
+  - Transitions.wait_time
+  - Transitions.activity_time
+  - Transitions.distribution_finder
+  - Transitions.avoidable_ed_admission
+  - Transitions.next_destination_tree
+  - transition_type
+  tests: []
+- id: simulation_output
+  name: Simulation Event Log and Network Data
+  description: 'Each `HSM` produces two data sets. The event log is `results_df`: one row per event,
+
+    added by `add_patient_result_row`, with patient id, run number, activity, simulation
+
+    timestamp, status ("scheduled", "start" or "completed"), instance id, time fields,
+
+    GP surgery, age, sex, primary care outcome, GP contact flag and ED avoidability.
+
+    Rows are appended through `store_patient_results` only after the warm-up. The network
+
+    data is `network_df`, built by `create_network_df` as every source-target pair of the
+
+    node ids in `node_lookup` with a weight counting transitions. `write_all_results`
+
+    appends both to the CSV paths in `G` (separate what-if paths), so all parallel runs
+
+    share one file per data set.
+
+    '
+  files:
+  - hsm.py
+  - g.py
+  - additional_documentation/bmj_open_paper.pdf
+  - additional_documentation/youtube_transcript.md
+  key_symbols:
+  - HSM.results_df
+  - HSM.network_df
+  - HSM.node_lookup
+  - HSM.create_network_df
+  - HSM.add_patient_result_row
+  - HSM.store_patient_results
+  - HSM.write_all_results
+  - G.network_graph_location
+  - G.wi_network_graph_location
+  tests: []
+- id: results_visualisation
+  name: Results Dashboard and Visualisation
+  description: 'The results page is driven by Dash callbacks in `callbacks.py` that react to the
+
+    run-number dropdown (where 999 means the mean over all runs). They read the event log
+
+    and network CSVs written by the model, plus observed Connected Yorkshire reference
+
+    data in `csv/cb_*.csv`, and pass them to helpers in `utilities.py`. `summary_stats`
+
+    computes the proportion of first contacts by service; `create_cyto_graph` builds
+
+    Cytoscape elements; `prep_draw_Sankey` and `draw_Sankey` build patient-flow Sankey
+
+    diagrams; `vol_fig`, `quarterly_counts` and `prep_admissions_table` produce call and
+
+    ED volume figures and avoidable-admission tables. What-if results are shown beside
+
+    baseline results when present. `figures.py` contains an older, unused age histogram.
+
+    '
+  files:
+  - callbacks.py
+  - utilities.py
+  - figures.py
+  - csv/cb_node_list.csv
+  - csv/cb_sankey.csv
+  - csv/cb_111_call_volumes.csv
+  - csv/cb_quarterly_counts.csv
+  - csv/cb_ed_attendance_volumes.csv
+  - additional_documentation/bmj_open_paper.pdf
+  key_symbols:
+  - summary_stat_page_content
+  - dropdown_run_number
+  - network_graph_draw
+  - sankey
+  - fig_qtr_counts
+  - downloadNetworkAnalysis
+  - summary_stats
+  - create_cyto_graph
+  - prep_draw_Sankey
+  - draw_Sankey
+  - draw_CB_Sankey
+  - vol_fig
+  - quarterly_counts
+  - prep_admissions_table
+  tests: []
+relationships:
+- from: dash_app_shell
+  to: run_orchestration
+  label: Supplies run settings to
+- from: run_orchestration
+  to: hsm_model
+  label: Creates and runs per replication
+- from: hsm_model
+  to: caller_entity
+  label: Generates callers
+- from: hsm_model
+  to: patient_journey
+  label: Starts a process per caller
+- from: patient_journey
+  to: caller_entity
+  label: Updates state of
+- from: patient_journey
+  to: transitions
+  label: Samples next step and times from
+- from: hsm_model
+  to: transitions
+  label: Configures by transition type
+- from: patient_journey
+  to: simulation_output
+  label: Records events in
+- from: hsm_model
+  to: simulation_output
+  label: Writes CSVs at end of run
+- from: results_visualisation
+  to: simulation_output
+  label: Reads CSVs from
+- from: dash_app_shell
+  to: results_visualisation
+  label: Hosts outputs of
+chapter_order:
+- id: dash_app_shell
+  filename: 01_dash_application_shell.qmd
+  xref: sec-dash-application-shell
+  one_line_summary: How the Dash app starts, routes between pages and stores run settings in the browser.
+  introduces:
+  - Dash app
+  - page routing
+  - dcc.Store
+  - long callback manager
+  - configuration page
+  - results page
+  builds_on: []
+- id: run_orchestration
+  filename: 02_run_configuration_and_orchestration.qmd
+  xref: sec-run-configuration-and-orchestration
+  one_line_summary: How form values become global parameters and launch parallel simulation runs.
+  introduces:
+  - global parameters (G)
+  - simulation duration
+  - warm-up period
+  - replication
+  - what-if scenario
+  - parallel runs
+  builds_on:
+  - dash_app_shell
+- id: hsm_model
+  filename: 03_health_service_model.qmd
+  xref: sec-health-service-model
+  one_line_summary: How one HSM replication sets up the SimPy environment and generates 111 calls over
+    time.
+  introduces:
+  - SimPy environment
+  - HSM
+  - arrival generator
+  - inter-arrival time
+  - inter-arrival type (ia_type)
+  - simulation clock
+  builds_on:
+  - run_orchestration
+- id: caller_entity
+  filename: 04_caller_and_call_dispositions.qmd
+  xref: sec-caller-and-call-dispositions
+  one_line_summary: What a simulated caller is and how its disposition and GP contact are sampled.
+  introduces:
+  - caller
+  - disposition code
+  - primary care outcome
+  - timely GP contact
+  builds_on:
+  - hsm_model
+- id: patient_journey
+  filename: 05_patient_journey_process.qmd
+  xref: sec-patient-journey-process
+  one_line_summary: How each caller is moved from service to service for 72 hours as a SimPy process.
+  introduces:
+  - patient journey
+  - SimPy process
+  - timeout
+  - follow-up window
+  - in-hours and out-of-hours
+  builds_on:
+  - hsm_model
+  - caller_entity
+- id: transitions
+  filename: 06_transitions_and_time_distributions.qmd
+  xref: sec-transitions-and-time-distributions
+  one_line_summary: How next destinations, wait times, visit durations and avoidable ED attendances are
+    sampled.
+  introduces:
+  - transition probabilities
+  - transition type
+  - queue time distribution
+  - activity time distribution
+  - avoidable ED attendance
+  - decision tree model
+  builds_on:
+  - hsm_model
+  - caller_entity
+  - patient_journey
+- id: simulation_output
+  filename: 07_simulation_event_log_and_network_data.qmd
+  xref: sec-simulation-event-log-and-network-data
+  one_line_summary: What the model records for each event and transition and how it is written to CSV.
+  introduces:
+  - event log
+  - event status
+  - instance id
+  - network graph data
+  - node lookup
+  builds_on:
+  - run_orchestration
+  - hsm_model
+  - patient_journey
+- id: results_visualisation
+  filename: 08_results_dashboard_and_visualisation.qmd
+  xref: sec-results-dashboard-and-visualisation
+  one_line_summary: How results callbacks turn simulation CSVs and observed data into charts, tables and
+    graphs.
+  introduces:
+  - Connected Yorkshire data
+  - summary statistics
+  - Sankey diagram
+  - Cytoscape network graph
+  - run-number dropdown
+  builds_on:
+  - dash_app_shell
+  - run_orchestration
+  - simulation_output

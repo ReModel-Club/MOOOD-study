@@ -1,0 +1,334 @@
+{
+  "schema": 2,
+  "plugin": {
+    "name": "codebase-tutorial",
+    "version": "2.0.0"
+  },
+  "generated_at": "2026-11-25T12:37:22Z",
+  "source": {
+    "repo_url": "https://github.com/ReModel-Club/MOOOD-study",
+    "commit": "2180be0d6a43b0e7aeb0fbc79bc3cc85395ac064",
+    "short": "2180be0",
+    "branch": "main",
+    "commit_date": "2026-11-25T11:16:10+00:00",
+    "dirty": true,
+    "dirty_files": [
+      ".codebase-tutorial.yml",
+      "additional_documentation/",
+      "output/"
+    ],
+    "commit_url": "https://github.com/ReModel-Club/MOOOD-study/commit/2180be0d6a43b0e7aeb0fbc79bc3cc85395ac064"
+  },
+  "project_name": "MOOOD-study",
+  "mode": "standalone",
+  "docs": null,
+  "section": null,
+  "format": "book",
+  "language": "English",
+  "theme": null,
+  "extensions": [
+    "code-line-style",
+    "code-window"
+  ],
+  "source_base_url": "none",
+  "audiences": [
+    {
+      "slug": "intermediate",
+      "preset": "intermediate",
+      "folder": ".",
+      "kind": "chapters"
+    }
+  ],
+  "args": {
+    "max_abstractions": 8,
+    "critique": "on",
+    "learning": "off",
+    "briefing": "none",
+    "include": null,
+    "exclude": [
+      "tests/**",
+      "docs/**",
+      ".venv/**",
+      "cache/**",
+      "data/**",
+      "__pycache__/**",
+      "output/**",
+      "csv/*.sav",
+      "assets/**",
+      "model.log"
+    ],
+    "extra_pages": [
+      "background.qmd"
+    ],
+    "background_sources": [
+      "additional_documentation/bmj_open_paper.pdf",
+      "additional_documentation/youtube_transcript.md",
+      "additional_documentation/youtube_video.txt"
+    ],
+    "update_note": "Chapters 1-8 cite additional_documentation/ (paper: all; talk transcript: 1-7). The PDF needs text extraction (e.g. pypdf) before writers can read it. background.qmd is not in the outline: revise it by hand when these sources change."
+  },
+  "chapters": [
+    {
+      "id": "dash_app_shell",
+      "name": "Dash Application Shell",
+      "filename": "01_dash_application_shell.qmd",
+      "files": [
+        {
+          "path": "index.py",
+          "blob": "1bcc55dc6375ffa1df4ca453e076b3032d308d56"
+        },
+        {
+          "path": "app.py",
+          "blob": "2979bef2ee21049658517820a165a4ec22dddb3d"
+        },
+        {
+          "path": "layouts.py",
+          "blob": "8e13b1afd9d2f8c556de2a393b5fd8b0866b8747"
+        },
+        {
+          "path": "homepage.py",
+          "blob": "2d403a59244c0ee38205a121a6a305012d9b5801"
+        },
+        {
+          "path": "simulation.py",
+          "blob": "b8532ae6cc13e2a73b80bf53fa33a0f49e4738f0"
+        },
+        {
+          "path": "results.py",
+          "blob": "e7d9a16e43095d4a57f502346ca91eabf5e7c972"
+        },
+        {
+          "path": "Dockerfile",
+          "blob": "5314f0618f3d154e2d58b3df98bcc7f76c34c136"
+        },
+        {
+          "path": "additional_documentation/bmj_open_paper.pdf",
+          "blob": "77ee9c6ebf91ec395a03e7215e311c98974f08fa"
+        },
+        {
+          "path": "additional_documentation/youtube_transcript.md",
+          "blob": "4abac4f16089c447cbddbdc9b33fc7a8d841f8e3"
+        }
+      ],
+      "tests": []
+    },
+    {
+      "id": "run_orchestration",
+      "name": "Run Configuration and Orchestration",
+      "filename": "02_run_configuration_and_orchestration.qmd",
+      "files": [
+        {
+          "path": "g.py",
+          "blob": "1a098269a266310b840d8a8011d0d665c8dfb1ac"
+        },
+        {
+          "path": "oneoneonedes.py",
+          "blob": "61645f5cfdb27afdd0d9d8c69aee31c943959773"
+        },
+        {
+          "path": "callbacks.py",
+          "blob": "3bf788ae7f4d2188d5e855a3d3211950af09b3d8"
+        },
+        {
+          "path": "additional_documentation/bmj_open_paper.pdf",
+          "blob": "77ee9c6ebf91ec395a03e7215e311c98974f08fa"
+        },
+        {
+          "path": "additional_documentation/youtube_transcript.md",
+          "blob": "4abac4f16089c447cbddbdc9b33fc7a8d841f8e3"
+        }
+      ],
+      "tests": []
+    },
+    {
+      "id": "hsm_model",
+      "name": "Health Service Model",
+      "filename": "03_health_service_model.qmd",
+      "files": [
+        {
+          "path": "hsm.py",
+          "blob": "4d43c68ba8e3bc63ef9fef8e37822c3b3a1b3b16"
+        },
+        {
+          "path": "csv/inter_arrival_times.csv",
+          "blob": "7d39fce1b25388da5361b3f694c1dacf5af76433"
+        },
+        {
+          "path": "csv/gp_surgeries.csv",
+          "blob": "13f79ead1e8c6f294e42a3b25ba44f4dcb482ee0"
+        },
+        {
+          "path": "additional_documentation/bmj_open_paper.pdf",
+          "blob": "77ee9c6ebf91ec395a03e7215e311c98974f08fa"
+        },
+        {
+          "path": "additional_documentation/youtube_transcript.md",
+          "blob": "4abac4f16089c447cbddbdc9b33fc7a8d841f8e3"
+        }
+      ],
+      "tests": [
+        {
+          "path": "tests/test_hsm.py",
+          "blob": "dedeb4e8759d2b8727fe0c75e40dae94b9c2d94b"
+        }
+      ]
+    },
+    {
+      "id": "caller_entity",
+      "name": "Caller and Call Dispositions",
+      "filename": "04_caller_and_call_dispositions.qmd",
+      "files": [
+        {
+          "path": "caller.py",
+          "blob": "ccb0a24a1478999415307eb8e3aff859893f57f4"
+        },
+        {
+          "path": "call_dispositions.py",
+          "blob": "7b3b2b75a7be1800be7d37ef0b937d931168a981"
+        },
+        {
+          "path": "csv/gp_contact_in_timeframe.csv",
+          "blob": "d1d654635275b745a3ef03084360f37a5cdc598e"
+        },
+        {
+          "path": "additional_documentation/bmj_open_paper.pdf",
+          "blob": "77ee9c6ebf91ec395a03e7215e311c98974f08fa"
+        },
+        {
+          "path": "additional_documentation/youtube_transcript.md",
+          "blob": "4abac4f16089c447cbddbdc9b33fc7a8d841f8e3"
+        }
+      ],
+      "tests": []
+    },
+    {
+      "id": "patient_journey",
+      "name": "Patient Journey Process",
+      "filename": "05_patient_journey_process.qmd",
+      "files": [
+        {
+          "path": "hsm.py",
+          "blob": "4d43c68ba8e3bc63ef9fef8e37822c3b3a1b3b16"
+        },
+        {
+          "path": "additional_documentation/bmj_open_paper.pdf",
+          "blob": "77ee9c6ebf91ec395a03e7215e311c98974f08fa"
+        },
+        {
+          "path": "additional_documentation/youtube_transcript.md",
+          "blob": "4abac4f16089c447cbddbdc9b33fc7a8d841f8e3"
+        }
+      ],
+      "tests": []
+    },
+    {
+      "id": "transitions",
+      "name": "Transitions and Time Distributions",
+      "filename": "06_transitions_and_time_distributions.qmd",
+      "files": [
+        {
+          "path": "transitions.py",
+          "blob": "413e2419f364bddd9cbcf06f3f31a0b723825d3a"
+        },
+        {
+          "path": "csv/transition_probs_gp_added.csv",
+          "blob": "2b3fb819404dbb8aa9cc14ebbcd3f5974eac0a3d"
+        },
+        {
+          "path": "csv/transition_probs_gp_added_no_quarters.csv",
+          "blob": "3786f52a0ba8c8f15645dcd227cd64d6f1f17a15"
+        },
+        {
+          "path": "csv/queue_time_distributions.txt",
+          "blob": "f74a58e70c1bacc77daf05753613a5ef58fa990a"
+        },
+        {
+          "path": "csv/activity_time_distributions.txt",
+          "blob": "05924365f948f5ced68269e7dd415ece83637907"
+        },
+        {
+          "path": "csv/avoidable_admission_by_PC_outcome_GP_contact.csv",
+          "blob": "f60058843c68eff56e4556183446b9863cd18375"
+        },
+        {
+          "path": "additional_documentation/bmj_open_paper.pdf",
+          "blob": "77ee9c6ebf91ec395a03e7215e311c98974f08fa"
+        },
+        {
+          "path": "additional_documentation/youtube_transcript.md",
+          "blob": "4abac4f16089c447cbddbdc9b33fc7a8d841f8e3"
+        }
+      ],
+      "tests": []
+    },
+    {
+      "id": "simulation_output",
+      "name": "Simulation Event Log and Network Data",
+      "filename": "07_simulation_event_log_and_network_data.qmd",
+      "files": [
+        {
+          "path": "hsm.py",
+          "blob": "4d43c68ba8e3bc63ef9fef8e37822c3b3a1b3b16"
+        },
+        {
+          "path": "g.py",
+          "blob": "1a098269a266310b840d8a8011d0d665c8dfb1ac"
+        },
+        {
+          "path": "additional_documentation/bmj_open_paper.pdf",
+          "blob": "77ee9c6ebf91ec395a03e7215e311c98974f08fa"
+        },
+        {
+          "path": "additional_documentation/youtube_transcript.md",
+          "blob": "4abac4f16089c447cbddbdc9b33fc7a8d841f8e3"
+        }
+      ],
+      "tests": []
+    },
+    {
+      "id": "results_visualisation",
+      "name": "Results Dashboard and Visualisation",
+      "filename": "08_results_dashboard_and_visualisation.qmd",
+      "files": [
+        {
+          "path": "callbacks.py",
+          "blob": "3bf788ae7f4d2188d5e855a3d3211950af09b3d8"
+        },
+        {
+          "path": "utilities.py",
+          "blob": "b3bcb49657190332fb671a066fabb7463d5b5f0a"
+        },
+        {
+          "path": "figures.py",
+          "blob": "96dcce1d3007b0d9828458db878c833639ca0bd3"
+        },
+        {
+          "path": "csv/cb_node_list.csv",
+          "blob": "e4981809ffa1e5a55d41e9963e16d0aab3c9edfa"
+        },
+        {
+          "path": "csv/cb_sankey.csv",
+          "blob": "1db7012f04f5a5e7ef39cbd9f8568c24b97b6871"
+        },
+        {
+          "path": "csv/cb_111_call_volumes.csv",
+          "blob": "61f03240f84c3938678cdbf2c7c49c4ac6813210"
+        },
+        {
+          "path": "csv/cb_quarterly_counts.csv",
+          "blob": "d06d13ad5bd5dec8282c9d36741000a38537d3aa"
+        },
+        {
+          "path": "csv/cb_ed_attendance_volumes.csv",
+          "blob": "00c3674e19c10973df602198e6dfc06b959c3da7"
+        },
+        {
+          "path": "additional_documentation/bmj_open_paper.pdf",
+          "blob": "77ee9c6ebf91ec395a03e7215e311c98974f08fa"
+        }
+      ],
+      "tests": []
+    }
+  ],
+  "pages": []
+}

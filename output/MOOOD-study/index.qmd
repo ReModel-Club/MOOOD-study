@@ -1,0 +1,82 @@
+# Overview {.unnumbered}
+
+**MOOOD-study** is a *discrete-event simulation* (built on **SimPy**) of people who ring
+NHS 111, the non-emergency health advice line. At the end of the call the call handler
+gives the caller an outcome, called a *disposition*, such as Dx05, which the code
+labels "contact" with a 2-hour time frame. The model simulates many such callers and follows each for 72 hours
+as they go on to contact a GP, 111 again, 999 (the emergency number), the emergency
+department (ED) or inpatient care (admission to hospital). It samples these onward contacts
+from **empirical transition probabilities** and **fitted time distributions** loaded from
+the `csv/` folder. Several independent replications run in parallel with `multiprocessing`,
+and each writes an **event log** and **network edge counts** to CSV. The simulated pattern
+is then compared with real data from *Connected Yorkshire*, a regional database that links patients'
+health records.
+
+You use it through a web app built with **Plotly Dash**. You configure a run (duration,
+warm-up, number of runs, a *what-if* scenario in which every caller gets timely GP contact,
+and alternative transition and arrival methods), press **Run Simulation**, and then view
+the results as charts, Sankey diagrams (flow diagrams), tables and a Cytoscape network graph.
+
+The code accompanies a published feasibility study, Pilbery et al. (2023) in *BMJ Open*, and a talk given for HSMA (Health Service Modelling Associates, an NHS training scheme in simulation and data science). For the research question, the data and how the code differs from the paper, read [The study behind the model](background.qmd) first.
+
+## Running the code
+
+Locally, run `python index.py`. Alternatively, follow the repository README to build and
+start the Docker container, then open <http://localhost:8080/>.
+
+## Where to start
+
+- New to NHS urgent care? Start with [The study behind the model](background.qmd).
+- New to simulation? Read chapters 1 to 3 in order.
+- Only interested in the model? Start at chapter 3.
+- Only interested in the charts? Jump to chapter 8.
+
+## Terms you will meet
+
+111 is the NHS non-emergency advice line and 999 the emergency number. ED is the emergency
+department, IP is inpatient care, and GP is the general practitioner. IUC is integrated
+urgent care (the service behind 111), so `Index_IUC` is the first 111 call. A disposition is
+the outcome code given at the end of the 111 call, and HSM is the Health Service Model
+class. See the [Glossary](glossary.qmd) for more.
+
+**Source repository:** <https://github.com/ReModel-Club/MOOOD-study>
+
+## How the pieces fit together
+
+```{mermaid}
+%%| label: fig-overview
+%%| fig-cap: "How the main parts of MOOOD-study relate to one another."
+flowchart TD
+    A0["Dash Application Shell"]
+    A1["Run Configuration and Orchestration"]
+    A2["Health Service Model"]
+    A3["Caller and Call Dispositions"]
+    A4["Patient Journey Process"]
+    A5["Transitions and Time Distributions"]
+    A6["Simulation Event Log and Network Data"]
+    A7["Results Dashboard and Visualisation"]
+    A0 -- "Supplies run settings to" --> A1
+    A1 -- "Runs one HSM per replication" --> A2
+    A2 -- "Generates callers" --> A3
+    A2 -- "Starts a process per caller" --> A4
+    A4 -- "Updates state of" --> A3
+    A4 -- "Samples next step and times" --> A5
+    A2 -- "Configures by transition type" --> A5
+    A4 -- "Records events in" --> A6
+    A2 -- "Writes CSVs at end of run" --> A6
+    A7 -- "Reads CSVs from" --> A6
+    A0 -- "Hosts outputs of" --> A7
+```
+
+## Chapters
+
+1. [Dash Application Shell](01_dash_application_shell.qmd) — How the Dash app starts, routes between pages and stores run settings in the browser.
+2. [Run Configuration and Orchestration](02_run_configuration_and_orchestration.qmd) — How form values become global parameters and launch parallel simulation runs.
+3. [Health Service Model](03_health_service_model.qmd) — How one HSM replication sets up the SimPy environment and generates 111 calls over time.
+4. [Caller and Call Dispositions](04_caller_and_call_dispositions.qmd) — What a simulated caller is and how its disposition and GP contact are sampled.
+5. [Patient Journey Process](05_patient_journey_process.qmd) — How each caller is moved from service to service for 72 hours as a SimPy process.
+6. [Transitions and Time Distributions](06_transitions_and_time_distributions.qmd) — How next destinations, wait times, visit durations and avoidable ED attendances are sampled.
+7. [Simulation Event Log and Network Data](07_simulation_event_log_and_network_data.qmd) — What the model records for each event and transition and how it is written to CSV.
+8. [Results Dashboard and Visualisation](08_results_dashboard_and_visualisation.qmd) — How results callbacks turn simulation CSVs and observed data into charts, tables and graphs.
+
+Terms introduced along the way are collected in the [Glossary](glossary.qmd).

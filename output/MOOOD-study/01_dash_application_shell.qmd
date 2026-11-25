@@ -1,0 +1,290 @@
+# Dash Application Shell {#sec-dash-application-shell}
+
+## Motivation: from a browser tab to a simulation run {#sec-dash-application-shell-motivation}
+
+Imagine an analyst opening the MOOOD-study web app for the first time. They click **Configuration**, set a 30-day simulation with three runs, press **Run Simulation**, wait for it to finish, then click **Results** to compare the model against observed data. Later they refresh the page, and the results page still knows which settings they chose.
+
+Something has to make all of that hang together: serve the pages, decide which one to show for a given URL, hold on to the chosen settings, and let a simulation run for minutes without freezing the browser. That something is the **Dash application shell**, the subject of this chapter. It does not run any simulation itself. It is the frame the rest of the project sits in.
+
+The shell is built with [Plotly Dash](https://dash.plotly.com/), which lets you write a web front end entirely in Python. A Dash app has two halves: a **layout** (a tree of components that describes what is on the page) and **callbacks** (Python functions that Dash runs when a component's value changes).
+
+The reason for a web app at all comes from the study. The BMJ Open paper (Pilbery et al., 2023) describes a dashboard that lets stakeholders view the results and run their own simulations, and the HSMA talk says it was built for people who are not technical. In the talk's words, it is essentially a web page with Python behind it. The study itself is introduced in [The study behind the model](background.qmd).
+
+::: {.column-margin}
+**Dash app**: the `Dash` object, created once in `app.py`, that owns the layout, callbacks and Flask server for the whole web front end.
+:::
+
+## The files at a glance {#sec-dash-application-shell-files}
+
+| File | Role |
+|---|---|
+| `app.py` | Creates the `Dash` instance, the long callback manager and logging; exposes `server` |
+| `index.py` | Entry point: sets `app.layout` and routes URLs to pages |
+| `layouts.py` | Shared style dictionaries and builders (`nav_bar`, `footer`, tab contents) |
+| `homepage.py` | The landing page layout (`home`) |
+| `simulation.py` | The configuration page layout (`simulation`) |
+| `results.py` | The results page layout (`results`) and its tab callback |
+
+@fig-dash-application-shell-structure shows how they depend on one another.
+
+```{mermaid}
+%%| label: fig-dash-application-shell-structure
+%%| fig-cap: "Import structure of the application shell"
+flowchart TD
+    A["app.py<br/>app, server, long_callback_manager"]
+    L["layouts.py<br/>styles, nav_bar, footer"]
+    H["homepage.py<br/>home"]
+    S["simulation.py<br/>simulation"]
+    R["results.py<br/>results"]
+    I["index.py<br/>app.layout, display_page"]
+    C["callbacks.py<br/>long callback, stores, charts"]
+    L --> H
+    L --> S
+    L --> R
+    A --> R
+    A --> I
+    H --> I
+    S --> I
+    R --> I
+    L --> I
+    C --> I
+    A --> C
+```
+
+Note that `app.py` imports nothing from the other project files. That is deliberate: every other module can import `app` without creating a circular import.
+
+## Creating the app {#sec-dash-application-shell-app}
+
+```{.python filename="app.py:8-21" code-line-style="hi:1-2,hi:13-14"}
+cache = diskcache.Cache("./cache")
+long_callback_manager = DiskcacheLongCallbackManager(cache)
+
+# This is not supported in python 3.8
+if version_info >= (3,9):
+    logging.basicConfig(format='%(asctime)s %(message)s', filename='model.log', encoding='utf-8', level=logging.DEBUG)
+
+app = Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.BOOTSTRAP, dbc.icons.FONT_AWESOME],
+    long_callback_manager=long_callback_manager,
+    )
+app.config.suppress_callback_exceptions = True
+server = app.server
+```
+
+::: {.column-margin}
+**Long callback manager**: the `DiskcacheLongCallbackManager` in `app.py` that lets a callback run in a background process and report back when it finishes.
+:::
+
+Three things happen here.
+
+- **The long callback manager.** Normally a Dash callback must return within a few seconds or the browser appears to hang. A simulation takes far longer, so Dash offers *long callbacks*, which run in a background process. The manager needs somewhere to store job state and results, and `DiskcacheLongCallbackManager` uses an on-disk `diskcache.Cache` in a `./cache` folder.
+- **The `Dash` instance.** It loads Bootstrap's stylesheet and the Font Awesome icons (used by the footer's social links) and is handed the manager so long callbacks can find it.
+- **`suppress_callback_exceptions`.** Only the shell is present when the page first loads. The simulation form and results page are inserted later by routing, so callbacks that mention their component ids would otherwise raise errors at start-up. This flag tells Dash to relax that check.
+
+`server = app.server` exposes the Flask server underneath Dash. This is what a production web server such as gunicorn needs, and the last line of the `Dockerfile` uses it:
+
+```{.text filename="Dockerfile:18-18"}
+CMD gunicorn -b 0.0.0.0:80 index:server
+```
+
+The paper (Pilbery et al., 2023) says a Docker environment is provided; the `Dockerfile` ends by starting the app with a production server (gunicorn).
+
+It reads as "from the module `index`, serve the object called `server`". Pointing at `index` rather than `app` matters: importing `index` registers the layout and every callback as a side effect, whereas importing only `app` would give an empty application.
+
+::: {.callout-note collapse="true" title="Refresher: why a long callback needs a manager"}
+A normal callback runs inside the web server's request. A long callback instead starts a job in a separate process and the browser polls for its progress. For that to work, the job's status and return value have to live somewhere both processes can reach, which is the job of the manager (here, files in `./cache`). The `running=` argument of a long callback, used in the next chapter's code, is what lets the UI show a spinner while the job is in flight.
+:::
+
+## The page layout and the stores {#sec-dash-application-shell-layout}
+
+`index.py` imports `app`, imports each page layout, and then assigns `app.layout`. This is the skeleton present on every URL.
+
+```{.python filename="index.py:16-32" code-line-style="hi:2-8,hi:10-11"}
+app.layout = html.Div([
+    dcc.Location(id='url', refresh=False), #this locates this structure to the url
+    dcc.Store(id='sim_start_date_store', storage_type='local'),
+    dcc.Store(id='sim_duration_store', storage_type='local'),
+    dcc.Store(id='warm_up_duration_store', storage_type='local'),
+    dcc.Store(id='store-num-runs', storage_type='local'),
+    dcc.Store(id='what_if_sim_run_store', storage_type='local'),
+    dcc.Store(id='transition_type_store', storage_type='local'),
+    dcc.Store(id='ia_time_store', storage_type='local'),
+    html.Div([
+        nav_bar(),
+        html.Div(id='page-content',style=CONTENT_STYLE), #we'll use a callback to change the layout of this section
+    ]),
+    html.Div([
+        footer()
+    ], className='w-100 container-fluid bg-secondary mt-5', style={"zIndex":'1', 'position':'relative', 'minHeight':'200px'})
+])
+```
+
+The pieces to notice:
+
+- **`dcc.Location`** is an invisible component that mirrors the browser's address bar. Its `pathname` property changes when the user navigates, and `refresh=False` means Dash swaps content without reloading the page.
+- **`dcc.Store`** components hold data in the browser rather than on the server. With `storage_type='local'`, the data goes into the browser's local storage, so it survives refreshes and even closing the tab. There is one store per run setting, matching the form controls on the configuration page: start date, duration, warm-up, number of runs, what-if choice, transition type and inter-arrival type.
+- **`nav_bar()` and `footer()`** are builders from `layouts.py`, so they appear on every page.
+- **`page-content`** is an empty `html.Div`, a slot for whichever page the URL asks for. `CONTENT_STYLE` (also from `layouts.py`) leaves a margin on the left so the fixed navigation bar does not cover it.
+
+::: {.column-margin}
+**dcc.Store**: a Dash component that keeps a value in the browser (here, local storage) so that other callbacks, and later page loads, can read it.
+:::
+
+## Page routing {#sec-dash-application-shell-routing}
+
+The page slot is filled by a single callback, `display_page`.
+
+```{.python filename="index.py:36-48" code-line-style="hi:1-2,hi:5-12"}
+@app.callback(Output('page-content', 'children'), #this changes the content
+              [Input('url', 'pathname')]) #this listens for the url in use
+def display_page(pathname):
+    if pathname == '/':
+        return home
+    elif pathname == '/home':
+        return home
+    elif pathname == '/simulation':
+        return simulation
+    elif pathname == '/results':
+         return results
+    else:
+        return '404' #If page not found return 404
+```
+
+Whenever `url.pathname` changes, Dash calls `display_page` and puts the returned component into `page-content.children`. The return values `home`, `simulation` and `results` are not functions: they are module-level `html.Div` trees built when the files are imported. That is simple, and it works because the pages are static. Anything that changes with data (chart contents, dropdown options) is filled in afterwards by callbacks.
+
+The navigation links in `layouts.py` point at the same paths. `external_link=True` makes each link a normal page load, so the browser requests the URL and Dash then runs `display_page` for it.
+
+```{.python filename="layouts.py:56-64"}
+        dbc.Nav(
+            [
+                dbc.NavLink("Home", href="/home",active="exact", external_link=True),
+                dbc.NavLink("Configuration", href="/simulation",active="exact", external_link=True),
+                dbc.NavLink("Results", href="/results", active="exact", external_link=True)
+            ],
+            pills=True,
+            vertical=True
+        ),
+```
+
+`active="exact"` highlights the link whose `href` matches the current path. Any other path falls through to the plain `'404'` string.
+
+## The three pages {#sec-dash-application-shell-pages}
+
+**Home** (`homepage.py`) is the landing page: a heading and introductory text, with no callbacks.
+
+**The configuration page** (`simulation.py`) is the form. Each control has an id that `callbacks.py` refers to later. For example, the duration slider:
+
+```{.python filename="simulation.py:42-51"}
+                        html.P('Sim duration in days', id='sim_duration_label', className='lead'),
+                        dcc.Slider(
+                            7,
+                            365,
+                            step=1,
+                            value=7,
+                            marks=None,
+                            id='sim_duration',
+                            tooltip={"placement": "bottom", "always_visible": True}
+                        ),
+```
+
+The form also has a date picker (`sim_start_date`, defaulting to `G.start_dt`), sliders for warm-up (`warm_up_time`, 0 to 2 days) and number of runs (`number_of_runs`, 1 to 100), and three radio groups: the what-if option, the transition type and the inter-arrival time method. The meaning of those settings is the topic of @sec-run-configuration-and-orchestration. At the bottom sit two buttons, **Run Simulation** (`run_sim`) and a disabled "Simulation running..." spinner (`sim_running`), plus hidden `dcc.Input` elements used as flags. Only one button is visible at a time, which is what `SHOW_BUTTON_STYLE` and `HIDE_BUTTON_STYLE` from `layouts.py` are for.
+
+::: {.callout-note title="In the study"}
+The configuration page offers the options shown in the HSMA talk's demo (start date, duration and number of runs), plus a few more. The talk mentions planned work (uploading custom arrival patterns and adjusting transition probabilities); the paper says only that others could re-parameterise the open-source model with their own regional data. That is not implemented here, because `simulation.py` has no upload control.
+:::
+
+**The results page** (`results.py`) holds the run-number dropdown, placeholder `html.Span` elements for summary figures and a set of tabs.
+
+```{.python filename="results.py:55-65"}
+@app.callback(
+    Output('tabs-results-content', 'children'),
+    Input('tabs-results', 'value')
+)
+def render_tab(tab):
+    if tab == 'tab-outcome':
+        return tab_outcome_content()
+    elif tab == 'tab-calldata':
+        return tab_calldata_content()
+    elif tab == 'tab-ed':
+        return tab_ed_content()
+```
+
+This is the same pattern as `display_page` one level down: the tab bar's `value` selects which builder from `layouts.py` supplies the content. Note that these are *functions* called on each tab change, so they produce fresh components. Filling those components with charts and tables is covered in @sec-results-dashboard-and-visualisation.
+
+## Storing run settings in the browser {#sec-dash-application-shell-stores}
+
+The stores declared in `app.layout` are written by a callback in `callbacks.py`, which `index.py` imports with `import callbacks`. That import is how the callbacks get registered.
+
+```{.python filename="callbacks.py:67-97"}
+@app.callback(
+    Output('sim_start_date_store', 'data'),
+    Output('sim_duration_store', 'data'),
+    Output('warm_up_duration_store', 'data'),
+    Output('store-num-runs', 'data'),
+    Output('what_if_sim_run_store', 'data'),
+    Output('transition_type_store', 'data'),
+    Output('ia_time_store', 'data'),
+
+    Input('run_sim', 'n_clicks'),
+
+    State('sim_start_date', 'date'),
+    State('sim_duration', 'value'),
+    State('warm_up_time', 'value'),
+    State('number_of_runs', 'value'),
+    State('what_if_sim_run_value', 'value'),
+    State('transition_type_value', 'value'),
+    State('ia_time_value', 'value')
+
+)
+def save_to_local_storage(run_sim, sim_start_date, sim_duration, warm_up_time, number_of_runs, what_if_sim_run_value, transition_type_value, ia_time_value):
+    # Sim complete is set to -1 on a refresh
+    # We only want to update local storage if the
+    # sim button has been pressed and so value has been set to 0
+    print(f"Submit button clicked, updating local storage {run_sim}")
+    global buttonClickCount
+
+    if run_sim > buttonClickCount:
+        return [sim_start_date, sim_duration, warm_up_time, number_of_runs, what_if_sim_run_value, transition_type_value, ia_time_value]
+    else:
+        raise PreventUpdate
+```
+
+The callback is triggered only by the **Run Simulation** button (`Input`). The form values are `State`s, meaning Dash reads them when the button is clicked but does not re-run the callback when they merely change. The seven outputs are the `data` properties of the seven stores. The module-level `buttonClickCount` starts at 0 in the main process. The long callback also assigns to it, but because it runs in a background process that update is not visible here, so in practice the `PreventUpdate` branch only stops the stores being overwritten when `n_clicks` is 0 (for example on page load or refresh).
+
+The payoff comes on the results page. Its summary callback reads the same stores as `State`s (for example `State('sim_duration_store', 'data')`) and prints the settings back to the user in the `*_state` spans seen in `results.py`. Because the stores use local storage, those settings are still available after a refresh, which is what lets the analyst in the opening scenario return to the results page later.
+
+The long callback that actually starts the simulation, `configSim`, lives in the same file and is registered with `manager = long_callback_manager`. What it does with the form values is the subject of @sec-run-configuration-and-orchestration.
+
+## What happens end to end {#sec-dash-application-shell-walkthrough}
+
+@fig-dash-application-shell-sequence follows the opening scenario through the shell.
+
+```{mermaid}
+%%| label: fig-dash-application-shell-sequence
+%%| fig-cap: "From page load to a saved run, and back to the results page"
+sequenceDiagram
+    participant U as Browser
+    participant D as display_page
+    participant L as configSim (long callback)
+    participant S as save_to_local_storage
+    U->>D: GET /simulation (url.pathname)
+    D-->>U: simulation layout into page-content
+    U->>S: click Run Simulation (n_clicks)
+    S-->>U: seven values into dcc.Store (local storage)
+    U->>L: click Run Simulation (n_clicks and form values)
+    L-->>U: sim_complete set to 1 when done
+    U->>D: GET /results (url.pathname)
+    D-->>U: results layout into page-content
+```
+
+1. The browser requests `/simulation`. Dash serves the skeleton from `app.layout`, and `display_page` fills `page-content` with the form.
+2. The user presses **Run Simulation**. Two callbacks listen to that button: `save_to_local_storage` writes the settings to the stores, and the long callback `configSim` starts the run in the background (swapping the two buttons via `running=`).
+3. When the run ends, `configSim` returns 1 to the hidden `sim_complete` input.
+4. The user clicks **Results**. `display_page` returns the `results` layout, and callbacks (@sec-results-dashboard-and-visualisation) read the stores and the CSV output to fill it in.
+
+## Conclusion {#sec-dash-application-shell-conclusion}
+
+The shell has four jobs. `app.py` creates the `Dash` app, a disk-backed long callback manager and the `server` that gunicorn serves. `index.py` defines one skeleton layout containing a navigation bar, a footer, a `dcc.Location` and seven `dcc.Store` components. `display_page` turns the URL into one of three page layouts. Finally, a callback copies the form values into local storage when the user starts a run.
+
+Next, in [Run Configuration and Orchestration](#sec-run-configuration-and-orchestration), we follow those form values into the long callback and see how they become global parameters and a set of parallel simulation runs.

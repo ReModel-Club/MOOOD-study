@@ -1,0 +1,285 @@
+# Transitions and Time Distributions {#sec-transitions-and-time-distributions}
+
+In [Patient Journey Process](#sec-patient-journey-process) we followed a caller around the loop that decides where they go next, waits, visits, and repeats for 72 hours. That loop asks a handful of questions but never answers them itself: "where next?", "how long until they get there?", "how long do they stay?" and "is this ED visit avoidable?". This chapter covers the class that answers them, `Transitions` in `transitions.py`.
+
+## The problem: turning observed data into random draws {#sec-transitions-and-time-distributions-problem}
+
+Our use case is a single caller who has just finished an Index IUC call (the initial 111 contact). The journey loop needs to know:
+
+1. Which service do they use next? (GP, ED, 999, IP, IUC, or the end of the journey.)
+2. How many minutes pass before that happens?
+3. If it is ED, is the visit avoidable, and how long does it last?
+
+Almost none of this is hard-coded. The transition probabilities were calculated (according to a docstring in `transitions.py`) with a custom R script, which is not part of this tutorial, and the wait and visit-time distributions are stored as fitted `scipy.stats` parameters. The BMJ Open paper (Pilbery et al., 2023) says the transition probabilities came from linked patient data, split by whether a timely primary care contact followed the index call and by yearly quarter. The HSMA talk adds that they come from a network analysis in which nobody returns to the index call. Treat the files under `csv/` as fixed inputs. The one fixed value is the 10-minute GP visit. `Transitions` loads those files once and exposes four sampling methods. Every simulated journey draws from them, so the same input data gives different, but statistically consistent, journeys on each replication.
+
+::: {.column-margin}
+**Transition probabilities**: for each service, the observed probability of moving to each other service next. See the [glossary](glossary.qmd).
+:::
+
+::: {.column-margin}
+**Queue time distribution**: a fitted statistical distribution for the wait between leaving one service and starting the next.
+:::
+
+## Loading the data {#sec-transitions-and-time-distributions-loading}
+
+Each [Health Service Model](#sec-health-service-model) replication builds one `Transitions` object (`self.t = Transitions(transition_type)` in `hsm.py`), so the files are read once per run rather than once per caller.
+
+```{.python filename="transitions.py:23-47" code-line-style="hi:4,dim:11-25"}
+class Transitions:
+
+    def __init__(self, transition_type):
+        self.transition_probs_df = pd.read_csv(G.transition_probs_gp_added) if (transition_type == 'qtr') else pd.read_csv(G.transition_probs_gp_added_no_quarters)
+        self.transition_type = transition_type
+
+        # Early (and terrible) attempt at using a decision tree model
+        self.dt_model =  pickle.load(open('csv/decision_tree_model.sav', 'rb'))
+
+        self.avoidable_ed_admission_df = pd.read_csv(G.avoidable_admission_by_PC_outcome_GP_contact)
+
+        q_data = []
+        with open("csv/queue_time_distributions.txt", "r") as inFile:
+            q_data = ast.literal_eval(inFile.read())
+        self.queue_time_distr = q_data
+
+        a_data = []
+        with open("csv/activity_time_distributions.txt", "r") as inFile:
+            a_data = ast.literal_eval(inFile.read())
+        self.activity_time_distr = a_data
+
+        inter_arrival_data = []
+        with open("csv/inter_arrival_time_distributions.txt", "r") as inFile:
+            inter_arrival_data = ast.literal_eval(inFile.read())
+        self.inter_arrival_time_distr = inter_arrival_data
+```
+
+The highlighted line is the key branch. The **transition type** (set on the configuration page and carried through the global parameters, see [Run Configuration and Orchestration](#sec-run-configuration-and-orchestration)) chooses between two transition tables: one with a `quarter` column, so probabilities vary by yearly quarter, and one without. The form offers three values:
+
+| Value on the form | Label | What it does |
+|---|---|---|
+| `qtr` | Base + Yearly Quarters | Loads the table whose probabilities vary by quarter (the default). |
+| `base` | Base | Loads the table with one set of probabilities for the whole year. |
+| `tree` | ML | Loads the table without quarters (the `else` branch), and also switches routing to a decision tree model (see the deep dive below). |
+
+The paper says the queue and activity distributions were chosen with the Python `fitter` package, picking the candidate with the lowest sum of squared errors (Pilbery et al., 2023).
+
+The three `.txt` files are not JSON but Python literals, so they are read with `ast.literal_eval`. The first two are lists of single-key dictionaries mapping a name to `{scipy_distribution_name: {parameters}}`. For example, an entry in the queue-time file looks like this:
+
+```{.text .illustrative filename="Example excerpt from csv/queue_time_distributions.txt"}
+{"Index_IUC_to_GP": {"gibrat": {"loc": -17.72725789494413, "scale": 170.76904170118738}}}
+```
+
+Here the key `Index_IUC_to_GP` names the hop, `gibrat` is the name of a `scipy.stats` distribution, and the inner dictionary holds its parameters. The activity-time file is keyed by the service alone (`999`, `IUC`, `IP`, and separate `ED_urgent` and `ED_non_urgent` entries).
+
+## Choosing the next destination {#sec-transitions-and-time-distributions-next-destination}
+
+The transition tables have one row per (source, target) pair, with the columns `SourceName`, `TargetName`, `quarter` (quarterly file only), and two probabilities: `ProbGPNo` and `ProbGPYes`. Two probability columns exist because a caller who received a timely GP contact (decided when the caller was created, see [Caller and Call Dispositions](#sec-caller-and-call-dispositions)) behaves differently from one who did not.
+
+```{.python filename="transitions.py:49-70" code-line-style="hi:9-14,dim:2-6"}
+    def next_destination(self, current_step: str, gp_timely_contact: str, quarter: int) -> str:
+        """
+        Determine the patient's next destination by sampling from previously determined
+        distributions. These were calculated using a custom script coded in R.
+
+        """
+
+        # User defined option to use transition probabilities that were calculated taking
+        # yearly quarter into account.
+        if self.transition_type == 'qtr':
+            df = self.transition_probs_df[(self.transition_probs_df.SourceName == current_step) & (self.transition_probs_df.quarter == quarter)]
+        else:
+            # Ignore yearly quarter adjustment
+            df = self.transition_probs_df[(self.transition_probs_df.SourceName == current_step)]
+
+        # There are separate transition probabilities for cases where a timely GP contact was
+        # made after the index 111 call
+        weights = df.ProbGPYes if gp_timely_contact == "yes" else df.ProbGPNo
+
+        # Randomly sample a destination from the transition probabilities
+        # End as current step should not trigger this function but just in case.
+        return "End" if current_step == "End" else random.choices(df.TargetName.tolist(), weights=weights.tolist())[0]
+```
+
+The paper describes weighting by whether primary care contact came immediately after the index call. In this code, every hop is weighted by the caller's `gp_timely_callback` flag, drawn when the caller is created (`transitions.py`, `caller.py`). For the `Index_IUC` rows, `ProbGPYes` equals `ProbGPNo` in `csv/transition_probs_gp_added.csv`, so the flag does not change the first hop in the baseline.
+
+The method filters the table down to the rows leaving `current_step` (and, in quarterly mode, the caller's quarter), picks the weight column according to `gp_timely_contact`, then calls Python's `random.choices`. This is a weighted draw from the standard library, not NumPy, so the weights need not sum to exactly one. The `"End"` guard is a safety net: the journey loop already stops before asking for a destination from `End`.
+
+## Sampling waits and visit durations {#sec-transitions-and-time-distributions-times}
+
+Both timing methods follow the same recipe: find the right fitted distribution, then draw from it until the result is positive. The finder comes first.
+
+```{.python filename="transitions.py:102-135" code-line-style="hi:12-13,dim:6-7"}
+    def distribution_finder(self, activity: str, distribution_type : str = 'queue', ED_urgent: str = '') -> list :
+        """
+            Look up function to retrieve distributions for queue times and activity duration times and
+            return them.
+        """
+
+        distribution = {}
+        return_list = []
+
+        # Select correct list depending on this distribution is being requested
+        search_dict = self.queue_time_distr if distribution_type == 'queue' else self.activity_time_distr
+
+        # There are separete distributions for urgent/non-urgent admissions, synonymous with non-avoidable/avoidable
+        # admissions
+
+        if activity == 'ED':
+            activity = f"{activity}_{ED_urgent}"
+
+        for i in search_dict:
+            for k,v in i.items():
+                if k == activity:
+                    distribution = v
+                    break
+
+        if len(distribution) > 0:
+            # Found a distribution, return the list
+            for k,v in distribution.items():
+                return_list.append(k)
+                return_list.append(v)
+                break
+
+        # TODO: Handle cases where no distribution is found
+
+        return return_list
+```
+
+`distribution_finder` returns a two-item list: `[distribution_name, parameter_dict]`. Passing `'activity'` as `distribution_type` searches the activity-time list instead of the queue-time list, and the ED special case turns `'ED'` into `'ED_urgent'` or `'ED_non_urgent'`. If nothing matches it returns an empty list, which would make the callers fail with an `IndexError`; the `TODO` records that this case is unhandled.
+
+Now the waiting time:
+
+```{.python filename="transitions.py:72-100" code-line-style="hi:7,hi:19-25"}
+    def wait_time(self, current_activity: str, next_activity: str) -> str :
+        """
+            Calculate the wait time in seconds before the next activity starts
+        """
+
+        # Prepare variable for distribution lookup.
+        activity = f"{current_activity}_to_{next_activity}"
+
+        # Next step is End, so wait time can be 0
+        if next_activity == "End":
+            # print("End")
+            return 0
+
+        wait_time = 0
+
+        distr = self.distribution_finder(activity)
+
+        # Use the appropriate distribution function from scipy.stats
+        sci_distr = getattr(scipy.stats, distr[0])
+
+        while True:
+            # Use the dictionary values, identify them as kwargs for use by scipy distribution function
+            q_time = np.floor(sci_distr.rvs(**distr[1]))
+            if q_time > 0:
+                # Sometimes, a negative number can crop up, which is nonsense with respect to q times.
+                wait_time = q_time
+                break
+
+        return wait_time
+```
+
+The queue key is built as `"<current>_to_<next>"`, matching names such as `Index_IUC_to_GP`. `getattr(scipy.stats, distr[0])` turns the stored string (say `"gibrat"`) into the real distribution object, and `.rvs(**distr[1])` draws a random variate using the stored parameters as keyword arguments. Because some fitted distributions have a negative `loc` (a shift), a draw can come out at zero or below. The loop therefore redraws, after rounding down, until the value is positive. This is a form of rejection sampling and it slightly reshapes the distribution near zero, which is a pragmatic trade-off. The docstring says seconds, but the value is handed straight to `env.timeout` in the journey loop, and the clock counts minutes (see [Global parameters](#sec-run-configuration-and-orchestration-g)), so these waits are in minutes. The `activity_time` shortcut for GP visits (10) is likewise in minutes.
+
+`activity_time` is almost identical, with one shortcut:
+
+```{.python filename="transitions.py:138-166" code-line-style="hi:7-9"}
+    def activity_time(self, activity: str, ED_urgent: str) -> int:
+        """
+            Look up function to retrieve the appropirate activity time distribution, sample from it and
+            then return the activity time.
+        """
+
+        gp_visit_time = 10 # Default gp visit time duration of 10 minutes since no end time in data
+
+        activity_time_min = 0
+
+        if activity == 'GP':
+            activity_time_min = gp_visit_time
+        else:
+
+            #print('Sending to distribution finder')
+            distr = self.distribution_finder(activity, 'activity', ED_urgent)
+
+            # Use the appropriate distribution function from scipy.stats
+            sci_distr = getattr(scipy.stats, distr[0])
+
+            while True:
+                # Use the dictionary values, identify them as kwargs for use by scipy distribution function
+                a_time = np.floor(sci_distr.rvs(**distr[1]))
+                if a_time > 0:
+                    # Sometimes, a negative number can crop up, which is nonsense with respect to q times.
+                    activity_time_min = a_time
+                    break
+
+        return activity_time_min
+```
+
+GP visits are a fixed 10 minutes because the source data has no end time for them. The paper describes activity times as fitted per service; the fixed GP value is a code-level exception (`transitions.py`). Everything else is sampled from the activity-time distribution, and the `ED_urgent` argument picks the right ED variant.
+
+## Avoidable ED attendances {#sec-transitions-and-time-distributions-avoidable}
+
+An ED visit is flagged as non-urgent (avoidable) with a probability that depends on the caller's primary care outcome and on whether they had a timely GP contact; both come from the caller object in [Caller and Call Dispositions](#sec-caller-and-call-dispositions).
+
+```{.python filename="transitions.py:168-179"}
+    def avoidable_ed_admission(self, pc_outcome: str, timely_gp_response: bool) -> bool:
+        """
+            Function to lookup probability of an admission to ED being avoidable, based on
+            the triage category of the 111 call and whether they saw a GP within the triage
+            category timeframe
+        """
+        # time_gp_response = True/False
+        # pc_outcome is string in form contact_2
+
+        aa_prob = self.avoidable_ed_admission_df[(self.avoidable_ed_admission_df['pc_outcome'] == pc_outcome) & (self.avoidable_ed_admission_df['gp_con_time'] == timely_gp_response)]['avoid_att']
+
+        return True if random.uniform(0, 1) < list(aa_prob)[0] else False
+```
+
+::: {.callout-note title="In the study"}
+The paper (Pilbery et al., 2023) defines an avoidable ED attendance using the O'Keeffe criteria: a type 1 ED visit with no investigation, treatment or referral that needed type 1 facilities. It stratifies the probability by primary care disposition and by timely contact. The lookup table below does the same, and the code calls the flag `non_urgent` where the paper says "avoidable". (The talk's early 14% against 11% figure was preliminary and is superseded by the paper.)
+:::
+
+The lookup table has columns `pc_outcome`, `gp_con_time` (`yes`/`no`) and `avoid_att`, for example `contact_12, no, 0.1469`. The method finds the matching row and performs a Bernoulli trial: draw a uniform number and compare it to the probability. The type hint says `bool`, but the table holds `"yes"`/`"no"` strings, and the caller passes `patient.gp_timely_callback`, so the comparison is between strings in practice.
+
+## How the journey loop uses it {#sec-transitions-and-time-distributions-using}
+
+@fig-transitions-and-time-distributions-flow shows one pass of the loop in `hsm.py` for our caller, with the `Transitions` calls in the order they happen.
+
+```{mermaid}
+%%| label: fig-transitions-and-time-distributions-flow
+%%| fig-cap: "One pass of the journey loop and the Transitions calls it makes"
+sequenceDiagram
+    participant J as Journey loop (hsm.py)
+    participant T as Transitions
+    participant D as scipy.stats
+    J->>T: next_destination("Index_IUC", gp_timely, quarter)
+    T-->>J: "ED"
+    J->>T: wait_time("Index_IUC", "ED")
+    T->>D: rvs(**params) until positive
+    D-->>T: 143.0
+    T-->>J: 143.0
+    J->>T: avoidable_ed_admission(pc_outcome, gp_timely)
+    T-->>J: True
+    J->>T: activity_time("ED", "non_urgent")
+    T->>D: rvs(**params) until positive
+    D-->>T: 187.0
+    T-->>J: 187.0
+```
+
+The numbers in the diagram are dummy values. The real calls are in the journey loop, shown in [Patient Journey Process](#sec-patient-journey-process-loop).
+
+The wait is sampled first and handed to `env.timeout`, so the SimPy clock advances. Only after that wait, and only when the destination is ED, is the avoidable flag drawn. `step_visit` then calls `self.t.activity_time(patient.activity, ED_urgent)` to decide how long the visit lasts. The `ED_urgent` label (`urgent`, `non_urgent` or `not applicable`) is also written to the event log; see [Simulation Event Log and Network Data](#sec-simulation-event-log-and-network-data).
+
+::: {.callout-note collapse="true" title="Deep dive: the 'tree' transition type and the what-if override"}
+When `transition_type` is `'tree'`, `hsm.py` calls `next_destination_tree` instead of `next_destination`. That method one-hot encodes the caller's primary care outcome, current and previous step, GP contact, quarter and in-hours/out-of-hours flag, and asks a pickled decision tree (`csv/decision_tree_model.sav`) to predict the next step. Its own docstring says it is "currently not in use due to poor performance", and the comment in `hsm.py` calls it "terrible", so treat it as an abandoned experiment. It also relies on `DataFrame.append`, which newer versions of pandas have removed.
+
+Separately, in a what-if run (see [Run Configuration and Orchestration](#sec-run-configuration-and-orchestration)) the journey loop skips `next_destination` entirely for the Index IUC step and sends the caller straight to `GP`. The remaining steps still use `Transitions` as normal.
+:::
+
+## Conclusion {#sec-transitions-and-time-distributions-conclusion}
+
+`Transitions` is the model's bridge from data to randomness. A weighted draw over a filtered table picks the next service, with separate weights for callers with and without a timely GP contact. Named `scipy.stats` distributions, stored as Python literals and redrawn until positive, supply wait and visit times. A simple probability lookup flags avoidable ED attendances. Beware the unhandled missing-distribution case and the unused decision-tree path.
+
+Next, in [Simulation Event Log and Network Data](#sec-simulation-event-log-and-network-data), we'll see how each of these sampled events is recorded and written out to CSV.

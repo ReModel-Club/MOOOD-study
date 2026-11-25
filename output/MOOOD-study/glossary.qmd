@@ -1,0 +1,148 @@
+# Glossary {#sec-glossary}
+
+Activity time distribution
+: A fitted `scipy.stats` distribution for how long a visit to a service lasts, stored in `csv/activity_time_distributions.txt` and keyed by service, with separate `ED_urgent` and `ED_non_urgent` entries. `activity_time` samples from it until it draws a positive value, except for GP visits, which are fixed at 10 minutes. See @sec-transitions-and-time-distributions.
+
+Arrival generator
+: The SimPy process `HSM.generate_111_calls`, which creates a `Caller`, starts that caller's journey process and then yields a `timeout` for the inter-arrival time before creating the next one. While it is paused, SimPy can run other processes, such as the callers' journeys. See @sec-health-service-model.
+
+Avoidable ED attendance
+: An attendance at a type 1 (consultant-led, 24-hour) emergency department where the patient received no investigation, treatment or referral that needed type 1 facilities. This is the O'Keeffe et al. definition used in the [BMJ Open paper](https://doi.org/10.1136/bmjopen-2023-076203). In the model, a Bernoulli draw flags each ED visit as `non_urgent` (avoidable) or `urgent`, using a probability looked up from the caller's primary care outcome and whether they had timely GP contact, and the flag selects which ED activity time distribution is used. See @sec-transitions-and-time-distributions and [The study behind the model](background.qmd).
+
+Caller
+: The simulation entity (the `Caller` class) for one person who has made an index 111 call. When it is created, it samples an age, a sex, a disposition code and a timely GP contact flag. It also holds state that the journey updates (the current activity, the timer and, on the decision-tree route, the previous step). See @sec-caller-and-call-dispositions.
+
+Configuration page
+: The `/simulation` page defined in `simulation.py`. It is a form with a start date picker, sliders for simulation duration, warm-up and number of runs, radio groups for the what-if option, transition type and inter-arrival method, and a **Run Simulation** button. See @sec-dash-application-shell.
+
+Connected Yorkshire data
+: Linked, patient-level health records for about 1.2 million people in Bradford and Airedale, covering 111 and 999 calls, primary care, ED and inpatient care. The study traced callers' contacts through it. In this repo, summaries of it are stored as `csv/cb_*.csv` and plotted beside the simulation output on the results page, labelled `cYorkshire2021` or with a `cb_` prefix. See @sec-results-dashboard-and-visualisation and [The study behind the model](background.qmd).
+
+Cytoscape network graph
+: An interactive node-and-edge diagram on the results page, drawn with `dash_cytoscape` from a flat list of `elements` that `create_cyto_graph` builds from the node list and the network edge counts. When all runs are selected, edge weights are averaged across runs, and edges that round to zero are left out. See @sec-results-dashboard-and-visualisation.
+
+Dash app
+: The `Dash` object, created once in `app.py`, that owns the layout, the callbacks and the Flask server for the whole web front end. The server is exposed as `server` so that gunicorn can serve it. See @sec-dash-application-shell.
+
+`dcc.Store`
+: A Dash component that keeps a value in the browser so that other callbacks, and later page loads, can read it. The app uses seven stores with `storage_type='local'` to hold the run settings, so the settings survive a page refresh. See @sec-dash-application-shell.
+
+Decision tree model
+: A pickled decision tree (`csv/decision_tree_model.sav`) that `next_destination_tree` uses to predict a caller's next step when the transition type is `'tree'`. Its inputs are one-hot encoded. It is an abandoned experiment: its docstring says it is not in use because of poor performance. See @sec-transitions-and-time-distributions.
+
+Discrete event simulation (DES)
+: A modelling method in which simulated entities (here, callers) move through processes and the clock jumps from one event to the next. It suits "what if" questions. MOOOD-study implements one with SimPy. See [The study behind the model](background.qmd) and @sec-health-service-model.
+
+Disposition code
+: The code (Dx05 to Dx75) recording the outcome of a caller's 111 triage, such as Dx05, which the code labels "contact" with a 2-hour time frame. Each caller is given one by a draw weighted by the probabilities in `CallDispositions.dx_codes`. The codes come from the code alone: neither the paper nor the talk defines them, or the difference between the "contact" and "speak" labels. See @sec-caller-and-call-dispositions.
+
+Event log
+: The `results_df` table, with one row each time a caller is scheduled for, starts or completes a service. Rows are recorded only after the warm-up period. At the end of a run, the table is appended to the shared results CSV (a separate file for what-if runs). See @sec-simulation-event-log-and-network-data.
+
+Event status
+: The `status` column of the event log, which is `scheduled`, `start` or `completed`. The gap between `scheduled` and `start` is the wait, and the gap between `start` and `completed` is the visit duration. See @sec-simulation-event-log-and-network-data.
+
+Follow-up window
+: The maximum time each caller is tracked after their index call: `G.pt_time_in_sim`, 4320 minutes (72 hours), matching the study's 72-hour linkage window. The journey loop checks it at the top of each step, so a final wait or visit can run past 72 hours. The run stops at a fixed time while calls keep arriving, so callers who arrive late in a run are cut off before their window ends. See @sec-patient-journey-process.
+
+Global parameters (`G`)
+: The class `G` in `g.py`, which is used as a namespace and never instantiated. It holds the run defaults (start date, durations in minutes, number of runs, resource capacities and the follow-up window) and the paths of the input and output CSV files. See @sec-run-configuration-and-orchestration.
+
+HSM
+: The Health Service Model class in `hsm.py`. One instance simulates one replication. It creates its own SimPy environment, five priority resources, a `Transitions` object and lookup tables. Its `run` method generates callers and then writes out the results. See @sec-health-service-model.
+
+HSMA (Health Service Modelling Associates)
+: An NHS training scheme in simulation and data science. The study's conference talk was given as part of it, and this book calls that talk "the HSMA talk". See [The study behind the model](background.qmd).
+
+In-hours and out-of-hours
+: The classification `HSM.ooh` makes from the caller's time fields. Weekday calls from 08:00 to 18:59 are `'in-hours'`; weekend calls and calls before 08:00 or from 19:00 are `'ooh'`. Only the decision-tree routing option uses it. The paper gives no hour boundaries but notes that most primary care dispositions happen out of hours. See @sec-patient-journey-process.
+
+Index call
+: The first 111 call, which enters a caller into the study cohort and starts their 72-hour follow-up. In the code it is the `Index_IUC` node. See [The study behind the model](background.qmd).
+
+Instance id
+: A counter that gives the order of a caller's interactions. It starts at 1 on the first pass, because it is incremented at the start of each pass through the journey loop, so the `scheduled`, `start` and `completed` rows for one visit share the same value. See @sec-simulation-event-log-and-network-data.
+
+Inter-arrival time
+: The gap in simulated minutes between one 111 call and the next. It is sampled from an exponential distribution whose mean is looked up in `csv/inter_arrival_times.csv` by hour, weekday flag and quarter. See @sec-health-service-model.
+
+Inter-arrival type (`ia_type`)
+: The user-selected method for adjusting the sampled inter-arrival time. `base` caps the exponential sample at 59 minutes. `max` and `minmax` resample against bounds derived from arrival rates. `mean` always uses the mean gap. The code's comments call `base` the best option, and it is the default. See @sec-health-service-model.
+
+IUC (integrated urgent care)
+: The NHS umbrella for urgent telephone and related services, of which 111 is the key part. In the code, `Index_IUC` is the index (first) 111 call, and `IUC` also appears as a service name in the transition tables and network. Related abbreviations: 999 is the emergency number, ED the emergency department and IP inpatient care (admitted to hospital). See [The study behind the model](background.qmd) and @sec-caller-and-call-dispositions.
+
+Long callback manager
+: The `DiskcacheLongCallbackManager` in `app.py`, which stores job state in an on-disk cache in `./cache`. It lets a callback such as `configSim` run in a background process and report back when it finishes. See @sec-dash-application-shell.
+
+Network analysis
+: The method the study used, in R outside this repository, to measure how callers move between services. It produced the transition probabilities that the simulation loads from CSV. See [The study behind the model](background.qmd) and @sec-transitions-and-time-distributions.
+
+Network graph data
+: The `network_df` table, which has one row for every possible source-target pair of node ids (42 rows) and a weight that counts the hops each caller makes between them. At the end of a run, it is appended to the shared network CSV (a separate file for what-if runs). See @sec-simulation-event-log-and-network-data.
+
+NHS 111
+: The NHS telephone service for urgent but not life-threatening health needs. A triage call ends with a disposition; the paper reports over 19 million calls in 2019/20, about 55% of which ended in a primary care disposition (Pilbery et al., 2023). See [The study behind the model](background.qmd).
+
+Node lookup
+: The `node_lookup` dictionary that maps the seven service names (`999`, `ED`, `End`, `GP`, `IP`, `IUC` and `Index_IUC`) to the integer ids 0 to 6 used in `network_df`. See @sec-simulation-event-log-and-network-data.
+
+Page routing
+: The `display_page` callback in `index.py`. It listens to the URL pathname from `dcc.Location` and puts the home, configuration or results layout into the `page-content` slot. Any other path returns `'404'`. See @sec-dash-application-shell.
+
+Parallel runs
+: The replications launched by `parallelProcess`, which first deletes the previous output files. It then uses a `multiprocessing.Pool` with one fewer worker than there are CPU cores to call `runSim` once for each run number. See @sec-run-configuration-and-orchestration.
+
+Patient journey
+: The ordered sequence of services one `Caller` visits after the index 111 call, until they reach `End` or the follow-up window closes. It is implemented as the generator `HSM.patient_journey`, and one copy runs for each caller. See @sec-patient-journey-process.
+
+Primary care outcome
+: The response that a disposition implies, written as the type of response and its time frame, such as `contact_2` (contact within 2 hours) or `speak_6`. It is the key used to look up the proportion of callers who get timely GP contact. See @sec-caller-and-call-dispositions.
+
+Queue time distribution
+: A fitted `scipy.stats` distribution for the wait between leaving one service and starting the next. These distributions are stored in `csv/queue_time_distributions.txt`, keyed by hop names such as `Index_IUC_to_GP`. `wait_time` samples from them until it draws a positive value. See @sec-transitions-and-time-distributions.
+
+Replication
+: One complete, independent run of the simulation, identified by its run number (counting from 0). Several replications are run so that results can be averaged over random variation. See @sec-run-configuration-and-orchestration.
+
+Results page
+: The `/results` page defined in `results.py`. It holds the run-number dropdown, placeholders for summary figures and a set of tabs. `render_tab` chooses the content of each tab, and callbacks then fill it with charts and tables. See @sec-dash-application-shell.
+
+Run-number dropdown
+: The `dropdown-run-number` component on the results page. Its value is a zero-based run index, or `999`, which means the mean over all runs. It is the shared input that triggers almost every results callback. See @sec-results-dashboard-and-visualisation.
+
+Sankey diagram
+: A flow diagram in which the width of each band is proportional to the number of patients moving between two nodes. The nodes are services at successive steps of a patient journey, such as `GP_2`. The results page shows simulated, what-if and observed versions. See @sec-results-dashboard-and-visualisation.
+
+SimPy environment
+: The `simpy.Environment` object, which holds the simulation clock and a queue of scheduled events. Each `HSM` creates its own environment, so two replications never share a clock. See @sec-health-service-model.
+
+SimPy process
+: An ordinary Python generator function registered with `env.process(...)`, which the environment then drives. The process pauses at each event it yields and resumes when that event fires, so many callers can be in the system at once without threads. See @sec-patient-journey-process.
+
+Simulation clock
+: `env.now`, the current simulated time in minutes since the start of the replication. It jumps from one scheduled event to the next and has nothing to do with wall-clock time. See @sec-health-service-model.
+
+Simulation duration
+: The nominal length of a run, in minutes, which is added to the warm-up and follow-up window to set when the simulation stops. The arrival generator never stops itself, so calls keep arriving until then. The user chooses it in days on the configuration page, and `configSim` multiplies it by 1440. The default in `G` is 5760 minutes (96 hours). See @sec-run-configuration-and-orchestration.
+
+Summary statistics
+: The percentage of first contacts that go to each service, which `summary_stats` computes from network edges whose source is the index 111 call (node 6). The results page shows them for the simulation, the what-if scenario and the observed data. See @sec-results-dashboard-and-visualisation.
+
+Timely GP contact
+: A primary care contact within the time frame set by the caller's triage outcome. It is the quantity the study's what-if scenario changes. The model draws it against the proportions in `csv/gp_contact_in_timeframe.csv` and stores it as `gp_timely_callback`; in what-if runs it is always "yes". It is a flag only: the wait before the GP contact is still sampled, not bounded by the time frame. See @sec-caller-and-call-dispositions.
+
+Timeout
+: The SimPy event that a process yields in order to sleep for a span of simulated time, for example `yield self.env.timeout(wait_time)`. See @sec-patient-journey-process.
+
+Transition probabilities
+: For each service, the observed probability of moving to each other service next. The table has separate `ProbGPYes` and `ProbGPNo` columns for callers with and without timely GP contact. `next_destination` makes a weighted draw from the rows for the current step. See @sec-transitions-and-time-distributions.
+
+Transition type
+: The setting that controls how next destinations are chosen. `'qtr'` (Base + Yearly Quarters) loads transition probabilities that vary by yearly quarter; `'base'` and `'tree'` (labelled ML) load the table without quarters, and `'tree'` also switches routing to the decision tree model. See @sec-transitions-and-time-distributions.
+
+Warm-up period
+: An initial stretch in which the model runs but records nothing, so that results are not distorted by starting from an empty system. The user sets it in days on the form, and the default in `G` is 1440 minutes (24 hours). See @sec-run-configuration-and-orchestration.
+
+What-if scenario
+: A run in which every caller gets timely GP contact. It is compared against a baseline run without that change, which `runSim` runs as a second `HSM`. What-if output goes to separate files with a `wi_` prefix. See @sec-run-configuration-and-orchestration.

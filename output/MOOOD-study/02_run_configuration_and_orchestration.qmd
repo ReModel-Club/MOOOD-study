@@ -1,0 +1,302 @@
+# Run Configuration and Orchestration {#sec-run-configuration-and-orchestration}
+
+In [Dash Application Shell](#sec-dash-application-shell) we saw how the Dash app starts, routes between pages and keeps run settings in the browser. The configuration page ends with a **Run Simulation** button, and this chapter follows what happens when it is pressed: how the form values become the parameters the model needs, and how those parameters launch several simulation runs in parallel.
+
+## The use case: one click, several replications {#sec-run-configuration-and-orchestration-use-case}
+
+Suppose a user opens the configuration page and chooses:
+
+- a start date of `2021-01-01`,
+- a **simulation duration** of 4 days,
+- a **warm-up period** of 1 day,
+- 3 runs, and
+- the **what-if scenario** switched on.
+
+The form speaks in days and calendar dates. The model speaks in minutes and timestamp strings. Between the click and the first simulated call, three things have to happen:
+
+1. the form values are converted and stored somewhere the model can read them,
+2. old output files are cleared away, and
+3. one **replication** (an independent run of the model with its own random draws) is started per requested run, spread across the CPU cores.
+
+Three pieces of code share this job, as @fig-run-configuration-and-orchestration-overview shows.
+
+```{mermaid}
+%%| label: fig-run-configuration-and-orchestration-overview
+%%| fig-cap: "From the Run button to parallel replications"
+flowchart LR
+    A["Configuration form"] --> B["configSim<br/>(callbacks.py)"]
+    B --> C["prepStartingVars<br/>(oneoneonedes.py)"]
+    C --> D["parallelProcess<br/>(oneoneonedes.py)"]
+    D --> E["runSim x N<br/>(worker processes)"]
+    E --> F["HSM.run()"]
+    G["class G<br/>(g.py)"] -. defaults .-> C
+    G -. file paths .-> D
+```
+
+::: {.callout-note title="In the study"}
+Several replications are needed because the model is stochastic: each run draws different random arrivals and journeys. The BMJ Open paper (Pilbery et al., 2023) reports 100 runs of one simulated year, with results given as means and 95% confidence intervals. The form's maxima (100 runs, 365 days) allow that, but the defaults are far smaller. `G` uses 3 runs, and the HSMA talk says its preliminary results came from three runs.
+:::
+
+::: {.column-margin}
+**Replication**: one complete, independent run of the simulation, identified by its run number (counting from 0). Several are run so that results can be averaged over random variation.
+:::
+
+## Global parameters: class `G` {#sec-run-configuration-and-orchestration-g}
+
+`G` in `g.py` is a plain class used as a namespace. Nothing instantiates it: other modules read attributes such as `G.sim_duration` directly. It holds two kinds of thing. First, the defaults for a run.
+
+```{.python filename="g.py:4-20" code-line-style="hi:5-7,hi:17"}
+class G:
+    call_inter = 0.5            # Call inter-arrival time in minutes
+    start_dt = "2021-01-01"
+
+    sim_duration = 5760       # 96 hours 5760 31556952 seconds in a year.
+    warm_up_duration = 1440    # 24 hours = 1440
+    number_of_runs = 3        # Number of runs
+    number_of_gp = 999
+    number_of_ed = 999
+    number_of_IP = 999
+    number_of_111 = 999
+    number_of_999 = 999
+
+    prob_callback = 0.5
+    prob_male = 0.4
+
+    pt_time_in_sim = 4320 # 4320 for 72 hours
+```
+
+Every time value is in **minutes**. `sim_duration` (5760, so 96 hours) is the nominal length of the run. It is added to the warm-up and the follow-up window to set when the clock stops; the arrival generator itself never stops, so callers keep arriving until then (see [Health Service Model](#sec-health-service-model-run)). `warm_up_duration` (1440, so 24 hours) is an initial stretch in which the model runs but records nothing, so that results are not distorted by starting from an empty system. The paper does not describe a warm-up period; it is a feature of this code. `pt_time_in_sim` (4320, so 72 hours) is the follow-up window that each caller is tracked for after their index call. It is a property of the model rather than of the form, so the user cannot change it. The capacity of 999 for each service is effectively unlimited. @sec-health-service-model shows how these become SimPy resources.
+
+The second kind is file paths. Output goes to `data/`, while inputs (observed data and transition tables) live in `csv/`:
+
+```{.python filename="g.py:22-26"}
+    all_results_location = 'data/all_results.csv'
+    network_graph_location = 'data/network_graph.csv'
+
+    wi_all_results_location = 'data/wi_all_results.csv'
+    wi_network_graph_location = 'data/wi_network_graph.csv'
+```
+
+The `wi_` prefix marks the what-if outputs, kept in separate files from the baseline so the results page can show them side by side. How rows get into these files is the subject of @sec-simulation-event-log-and-network-data.
+
+::: {.column-margin}
+**What-if scenario**: a run in which every caller gets timely GP contact, compared against a baseline run without that change. See @sec-caller-and-call-dispositions.
+:::
+
+## From form to model: `configSim` {#sec-run-configuration-and-orchestration-configsim}
+
+The **Run Simulation** button triggers a *long callback*. As @sec-dash-application-shell explained, ordinary Dash callbacks time out on slow work, so long callbacks hand the work to a background manager. Here is the whole function.
+
+```{.python filename="callbacks.py:19-64" code-line-style="hi:20-22,hi:34-39"}
+@app.long_callback(
+    output = (
+        Output('sim_complete', 'value')
+    ),
+    inputs = (
+        Input('run_sim', 'n_clicks'),
+        State('sim_duration', 'value'),
+        State('warm_up_time', 'value'),
+        State('number_of_runs', 'value'),
+        State('sim_start_date', 'date'),
+        State('what_if_sim_run_value', 'value'),
+        State('transition_type_value', 'value'),
+        State('ia_time_value', 'value')
+    ),
+    running = [
+        (Output('submit_button', 'style'), HIDE_BUTTON_STYLE, SHOW_BUTTON_STYLE),
+        (Output('sim_run_button', 'style'), SHOW_BUTTON_STYLE, HIDE_BUTTON_STYLE),
+    ],
+    manager = long_callback_manager,
+    prevent_initial_call = True
+)
+def configSim(run_sim, sim_duration, warm_up_time, number_of_runs, sim_start_date, what_if_sim_run, transition_type_value, ia_time_value):
+    # Run the sim
+    logging.debug("Run the sim")
+
+    global buttonClickCount
+
+    if run_sim > buttonClickCount:
+        logging.debug('run_sim > buttonClickCount')
+        print('run_sim > buttonClickCount')
+        print(f"Sim duration {sim_duration} and warm up {warm_up_time}")
+        buttonClickCount = run_sim
+        prepStartingVars(
+            number_of_runs = number_of_runs,
+            warm_up_time = warm_up_time * 1440,
+            sim_duration = sim_duration * 1440,
+            sim_start_date = f"{sim_start_date} 00:00:00",
+            what_if_sim_run = what_if_sim_run,
+            transition_type = transition_type_value,
+            ia_type = ia_time_value
+        )
+        parallelProcess()
+
+        return 1
+    else:
+        return 0
+```
+
+A few points are worth noticing.
+
+- Only the button click is an `Input`. Everything else is a `State`, so changing a slider does nothing until **Run Simulation** is pressed.
+- The `running` list swaps two buttons while the work is in progress: the Run Simulation button is hidden and a "running" one is shown, then they swap back.
+- `buttonClickCount` is a module-level counter meant to ignore callbacks that fire without a new click. Be careful, though: the long callback runs in a separate background process, so its update to the counter is never seen by the main process (which `save_to_local_storage` uses). In practice the test only filters out the initial `n_clicks == 0` call.
+- The unit conversion happens here: days become minutes (`* 1440`, since 24 × 60 = 1440), and the date picker's `YYYY-MM-DD` string gets `" 00:00:00"` appended to become a timestamp string.
+- The return value, `1`, goes into the `sim_complete` component, which the results page can watch to know the run has finished. Chapters 3 onwards describe what is computed inside `parallelProcess()`.
+
+The `transition_type` and `ia_type` values are the other two form choices. They are passed straight through here and explained in @sec-health-service-model and @sec-transitions-and-time-distributions.
+
+### Saving the same values for the results page
+
+A companion callback, `save_to_local_storage`, runs on the same click and copies the raw form values (days, not minutes) into the `dcc.Store` components from the app shell, so the results page can show the settings that produced the data. See [Dash Application Shell](#sec-dash-application-shell-stores) for its code.
+
+
+It is a plain `@app.callback`, so it responds immediately, whereas `configSim` may take minutes. When there is no new click it raises `PreventUpdate`, which tells Dash to leave the stores unchanged. Because it is not a long callback, the `buttonClickCount` it sees is the main-process copy, which stays 0.
+
+## Overwriting the model's globals: `prepStartingVars` {#sec-run-configuration-and-orchestration-prep}
+
+The model entry point is `oneoneonedes.py`. At import time it creates module-level variables initialised from `G`:
+
+```{.python filename="oneoneonedes.py:20-26"}
+number_of_runs = G.number_of_runs
+warm_up_time = G.warm_up_duration
+sim_duration = G.sim_duration
+sim_start_date = G.start_dt
+what_if_sim_run = "No"
+transition_type = "qtr"
+ia_type = "base"
+```
+
+These are the defaults you get if you run the file from the command line. `prepStartingVars` replaces them with the user's choices.
+
+```{.python filename="oneoneonedes.py:51-78" code-line-style="hi:3-12"}
+def prepStartingVars(**kwargs):
+    logging.debug('Prepping starting vars')
+    print('Prepping start vars')
+    # Update global variables, not create local version with same name
+    global number_of_runs
+    global warm_up_time
+    global sim_duration
+    global sim_start_date
+    global what_if_sim_run
+    global transition_type
+    global ia_type
+
+    for k,v in kwargs.items():
+        if k == "number_of_runs":
+            number_of_runs = v
+        elif k == "warm_up_time":
+            warm_up_time = v
+        elif k == "sim_duration":
+            sim_duration = v
+            #print(f"Sim duration in prep starting vars is {sim_duration}")
+        elif k == "sim_start_date":
+            sim_start_date = v
+        elif k == 'what_if_sim_run':
+            what_if_sim_run = v
+        elif k == 'transition_type':
+            transition_type = v
+        elif k == 'ia_type':
+            ia_type = v
+```
+
+The `global` declarations matter: without them, each assignment would create a local variable that vanished on return. The loop accepts any subset of the seven keyword arguments, and ignores unknown keys. Using module globals rather than passing a settings object keeps `parallelProcess()` callable with no arguments, at the cost of hidden state, so it is worth remembering that these globals are the real "current settings".
+
+## Launching the parallel runs {#sec-run-configuration-and-orchestration-parallel}
+
+`parallelProcess` is where the **parallel runs** start. It first clears out last time's output, then maps `runSim` over the run numbers.
+
+```{.python filename="oneoneonedes.py:82-98" code-line-style="hi:8-10,hi:12"}
+def parallelProcess(nprocess = mp.cpu_count() - 1):
+    logging.debug('Model called')
+    global warm_up_time
+    global sim_duration
+    global what_if_sim_run
+    global transition_type
+    global ia_type
+
+    file_locs = [G.all_results_location, G.wi_all_results_location, G.network_graph_location, G.wi_network_graph_location]
+
+    [os.remove(x) for x in file_locs if os.path.isfile(x)]
+
+    pool = mp.Pool(processes = nprocess)
+    pool.starmap(runSim, zip(list(range(0, number_of_runs)), [number_of_runs] * number_of_runs, [sim_duration] * number_of_runs, [warm_up_time] * number_of_runs, [sim_start_date] * number_of_runs, [what_if_sim_run] * number_of_runs, [transition_type] * number_of_runs, [ia_type] * number_of_runs))
+
+    logging.debug('Reached end of script')
+    logging.shutdown()
+```
+
+1. The four output files from `G` are deleted if present. This is essential: as @sec-simulation-event-log-and-network-data explains, every replication *appends* to the same files, so stale rows from an earlier run would otherwise be mixed in.
+2. A `multiprocessing.Pool` is created with one fewer worker than there are CPU cores, leaving a core free for the web server.
+3. `starmap` calls `runSim` once per run number. `zip` pairs each run number with a copy of every other setting, so each call receives its own tuple of eight arguments. `starmap` blocks until every run has finished, which is why `configSim` is a long callback.
+
+If you run `python oneoneonedes.py` directly, the `if __name__ == "__main__"` block at the bottom calls `parallelProcess` with the defaults and no web app involved.
+
+## One replication: `runSim` {#sec-run-configuration-and-orchestration-runsim}
+
+Each worker process runs `runSim`.
+
+```{.python filename="oneoneonedes.py:32-48" code-line-style="hi:7-12"}
+def runSim(run, total_runs, sim_duration, warm_up_time, sim_start_date, what_if_sim_run, transition_type, ia_type):
+    #print(f"Inside runSim and {sim_start_date} and {what_if_sim_run}")
+
+    start = time.process_time()
+
+    print (f"{current_time()}: Run {run+1} of {total_runs}")
+    logging.debug(f"{current_time()}: Run {run+1} of {total_runs}")
+    my_111_model = HSM(run, sim_duration, warm_up_time, sim_start_date, what_if_sim_run, transition_type, ia_type)
+    my_111_model.run()
+    if what_if_sim_run == 'Yes':
+        # If what if model running, also need to run it without to generate comparison results
+        print("Starting what if is No simulation following Yes")
+        my_111_model = HSM(run, sim_duration, warm_up_time, sim_start_date, "No", transition_type, ia_type)
+        my_111_model.run()
+
+    print(f'{current_time()}: Run {run+1} took {round((time.process_time() - start)/60, 1)} minutes to run')
+    logging.debug(f'{current_time()}: Run {run+1} took {round((time.process_time() - start)/60, 1)} minutes to run')
+```
+
+It builds an `HSM` (the health service model, the subject of @sec-health-service-model) with this run's number and settings, then calls `run()`. When the what-if scenario is on, it builds a *second* `HSM` with `"No"` and runs that too, so every what-if run has a baseline to compare against. This matches the paper, which compares the what-if scenario against a baseline (Pilbery et al., 2023). Both use the same `run` number, but they write to different files (the `wi_` ones for the what-if model), so they do not collide.
+
+Note that the baseline is not shared across runs: each replication gets its own baseline model. Timing uses `time.process_time()`, which counts CPU time of the worker rather than wall-clock time.
+
+## Under the hood: the sequence of events {#sec-run-configuration-and-orchestration-sequence}
+
+@fig-run-configuration-and-orchestration-sequence shows the example from the start of the chapter: three runs with the what-if scenario on.
+
+```{mermaid}
+%%| label: fig-run-configuration-and-orchestration-sequence
+%%| fig-cap: "What happens when Run is clicked (3 runs, what-if on)"
+sequenceDiagram
+    participant U as User
+    participant CS as configSim
+    participant PV as prepStartingVars
+    participant PP as parallelProcess
+    participant W as Worker pool
+    participant HSM as HSM
+    U->>CS: click Run Simulation
+    CS->>PV: days to minutes, date to timestamp
+    PV-->>CS: module globals updated
+    CS->>PP: parallelProcess()
+    PP->>PP: delete old CSV outputs
+    PP->>W: starmap(runSim, runs 0, 1, 2)
+    W->>HSM: HSM(what-if Yes).run()
+    W->>HSM: HSM(what-if No).run()
+    W-->>PP: all runs finished
+    PP-->>CS: return
+    CS-->>U: sim_complete = 1
+```
+
+Each of the three workers does the pair of `HSM` runs for its own run number. They proceed independently, which is why a machine with more cores finishes the same experiment sooner.
+
+::: {.callout-note collapse="true" title="Refresher: why module globals and multiprocessing interact carefully"}
+`multiprocessing.Pool` starts separate operating-system processes, each with its own copy of module state. That is why `parallelProcess` passes every setting to `runSim` as an argument instead of letting workers read the globals: a worker cannot see changes made to the parent's variables after it was created. Note that the settings are set in the parent *before* the pool is built, and each task carries its own copy of them.
+
+The same separation is why all runs write to shared CSV files by appending, rather than returning data to the parent.
+:::
+
+## Conclusion {#sec-run-configuration-and-orchestration-conclusion}
+
+Class `G` provides defaults and file paths, all times in minutes. `configSim` converts the form's days and dates, `prepStartingVars` writes them into the globals of `oneoneonedes.py`, and `parallelProcess` clears old output and fans out one `runSim` per replication, each of which builds an `HSM` (twice, in what-if mode). A companion callback stores the raw form values in the browser for the results page.
+
+Next, in [Health Service Model](#sec-health-service-model), we open up the `HSM` class that `runSim` creates and see how it generates 111 calls over time.

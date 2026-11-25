@@ -1,0 +1,194 @@
+# Caller and Call Dispositions {#sec-caller-and-call-dispositions}
+
+In [Health Service Model](#sec-health-service-model) we saw the arrival generator creating 111 calls one after another across the simulation clock. Each time it does so, it calls `Caller(self.patient_counter, self.what_if_sim_run)` (see [Health Service Model](#sec-health-service-model-arrivals)). This chapter looks at what that constructor builds, and in particular how it decides, at the moment of the call, what the 111 service will advise and whether a GP will get in touch in time.
+
+## The use case: one caller rings 111 {#sec-caller-and-call-dispositions-use-case}
+
+Imagine the generator has just created caller number 42. Before anything else can happen to them, the model has to answer some questions:
+
+- Who are they (age and sex)?
+- What did the 111 call handler conclude (the **disposition**)?
+- What does that disposition mean for primary care (the **primary care outcome**)?
+- Did a GP actually make contact within the recommended time frame?
+
+The answers are drawn once, when the `Caller` object is constructed, and are then fixed for the rest of the journey. Everything else on the object (timer, activity and so on) is mutable state, mostly updated later by the journey process in @sec-patient-journey-process.
+
+::: {.column-margin}
+**Caller**: the simulation entity for one person who has made an index 111 call. See the [glossary](glossary.qmd).
+:::
+
+::: {.column-margin}
+**Disposition code**: the code (Dx05 to Dx75) recording the outcome of the 111 call, such as Dx05, labelled `contact` with a 2-hour time frame.
+:::
+
+## Key concepts {#sec-caller-and-call-dispositions-concepts}
+
+A **disposition** is the advice code a 111 call handler ends the call with. The BMJ Open paper (Pilbery et al., 2023) defines a primary care disposition as the triage outcome that refers the caller to a primary care service, with a time frame, and says that either 111 asks the service to contact the caller or the caller is told to make contact. The code tags each Dx code as `contact` or `speak`, but neither the paper nor the HSMA talk says what those two labels mean, and the Dx codes themselves appear only in the code. Treat the labels as the code's own classification, and don't read more into them than that. Dx05, for example, is labelled `contact` with a 2-hour time frame. IUC stands for integrated urgent care, the service behind NHS 111, so `Index_IUC` is the index (first) 111 call.
+
+::: {.callout-note title="In the study"}
+The paper reports that about 55% of 111 calls led to a primary care disposition, and that over 96% of those referrals were to a GP or out-of-hours GP (Pilbery et al., 2023). This is consistent with the model having a single `GP` node, though the paper does not say that was the reason. Its limitations note instead that pharmacy, mental health and optician contacts are missing from the data. It also defines **timely contact** as primary care contact within the time frame set by the triage outcome, which is what `gp_timely_callback` records. The paper says the disposition and the timely flag are drawn using proportions from the Connected Yorkshire data, which matches the `prob` and `prop` columns below.
+:::
+
+Two small classes are involved.
+
+1. `CallDispositions` in `call_dispositions.py` is a pure lookup holder. It has no methods or instances: it just stores two pandas tables as class attributes, so every caller can read them.
+2. `Caller` in `caller.py` is the entity. Its `__init__` samples from those tables.
+
+### The disposition table {#sec-caller-and-call-dispositions-table}
+
+```{.python filename="call_dispositions.py:15-27" code-line-style="hi:5-10"}
+class CallDispositions:
+
+    # Note that in the dataset, there were no 20 minute callbacks Dx61
+    dx_codes = pd.DataFrame(
+        {
+            "disposition"       : ["Dx05", "Dx06", "Dx07", "Dx08", "Dx11", "Dx12", "Dx13", "Dx14", "Dx15", "Dx75"],
+            "time_frame_hours"  : [2, 6, 12, 24, 1, 2, 6, 12, 24, 72],
+            "contact_speak"     : ["contact", "contact", "contact", "contact", "speak", "speak", "speak", "speak", "speak", "contact"],
+            "pc_outcome"        : ["contact_2", "contact_6", "contact_12", "contact_24", "speak_1", "speak_2", "speak_6", "speak_12", "speak_24",  "contact_72"],
+            "prob"              : [0.296, 0.204, 0.069, 0.125, 0.165, 0.0526, 0.0308, 0.00995, 0.0124, 0.0344],
+        }
+    )
+    dx_codes.set_index("disposition", inplace=True)
+```
+
+Each row is a disposition code. The highlighted columns carry the useful information:
+
+- `time_frame_hours` is the window in which primary care should respond.
+- `contact_speak` is a `contact` or `speak` label for each code. The sources don't define the two categories, and nothing in the code reads this column, so it is descriptive only.
+- `pc_outcome` is the **primary care outcome**: the disposition's meaning, written as the kind of response and its time frame, for example `contact_2` or `speak_6`.
+- `prob` is how likely that disposition is for an index call, taken from the study's data.
+
+The last line makes the disposition code the index, which is why the `Caller` can later look rows up by code.
+
+::: {.column-margin}
+**Primary care outcome**: the response implied by a disposition, such as `contact_2` (contact within 2 hours). It is the key used to find the GP-contact proportion.
+:::
+
+### The timely GP contact table {#sec-caller-and-call-dispositions-gp-table}
+
+```{.python filename="call_dispositions.py:32-32"}
+    gp_timely_contact = pd.read_csv("csv/gp_contact_in_timeframe.csv")
+```
+
+This loads `csv/gp_contact_in_timeframe.csv` once, when the module is first imported. Its columns are `pc_outcome`, `gp_con_yes`, `n` and `prop`. For example, the first rows show that for `contact_2` about 33.3% of calls (11,978 of 35,974) received GP contact in the timeframe, while for `contact_12` it was about 45.7%. The `prop` column is what the caller uses.
+
+::: {.column-margin}
+**Timely GP contact**: whether the caller was contacted by a GP within the time frame implied by their primary care outcome. Stored on the caller as `gp_timely_callback`.
+:::
+
+## Using it {#sec-caller-and-call-dispositions-using}
+
+The arrival generator only needs two lines of context: a unique id and whether this is a what-if run (see @sec-run-configuration-and-orchestration).
+
+```{.python .illustrative filename="Example usage"}
+pt = Caller(42, "No")
+
+print(pt.activity)             # Index_IUC
+print(pt.disposition)          # e.g. Dx05
+print(pt.pc_outcome)           # e.g. contact_2
+print(pt.gp_timely_callback)   # "yes" or "no"
+```
+
+The values printed for `disposition`, `pc_outcome` and `gp_timely_callback` are random, so they differ between runs. With `"Yes"` as the second argument, `gp_timely_callback` is always `"yes"`.
+
+## Under the hood: the constructor step by step {#sec-caller-and-call-dispositions-walkthrough}
+
+The constructor works in this order:
+
+1. Sample age from a beta distribution, and sex from `G.prob_male`.
+2. Set the starting activity to `Index_IUC` and the timer to zero.
+3. Draw a disposition code, weighted by `prob`.
+4. Look up that code's `pc_outcome` (and its probability).
+5. Look up the proportion of such calls getting timely GP contact, and draw a yes or no.
+6. Initialise the time-tracking fields that the journey will update.
+
+```{mermaid}
+%%| label: fig-caller-and-call-dispositions-sequence
+%%| fig-cap: "What happens inside Caller.__init__"
+sequenceDiagram
+    participant HSM as HSM generator
+    participant C as Caller
+    participant D as CallDispositions
+    HSM->>C: Caller(patient_counter, what_if_sim_run)
+    C->>C: sample age and sex
+    C->>D: dx_codes index and prob
+    D-->>C: weighted random disposition
+    C->>D: pc_outcome for disposition
+    D-->>C: e.g. contact_2
+    C->>D: gp_timely_contact prop for pc_outcome
+    D-->>C: proportion
+    C->>C: draw yes or no
+    C-->>HSM: Caller ready
+```
+
+@fig-caller-and-call-dispositions-sequence shows that `Caller` does all of the sampling itself. `CallDispositions` never runs any code of its own.
+
+## Under the hood: the code {#sec-caller-and-call-dispositions-code}
+
+### Demographics and starting point {#sec-caller-and-call-dispositions-demographics}
+
+```{.python filename="caller.py:19-26" code-line-style="hi:3,hi:5"}
+    def __init__(self, p_id, what_if_sim_run):
+        self.id = p_id
+        self.age = math.floor(random.betavariate(0.733, 2.82)*100)
+        self.prob_male = G.prob_male
+        self.sex = "male" if random.uniform(0, 1) < self.prob_male else "female"
+        self.timer = 0
+        self.gp = ""
+        self.activity = "Index_IUC" # All callers/patients start with the index 111 call
+```
+
+The paper says the model ignores age and sex, and the code matches: they are sampled, then only written to the event log (`hsm.py`) and never used to choose a route. Age comes from a beta distribution with shape parameters 0.733 and 2.82. A beta variate lies between 0 and 1, so multiplying by 100 and flooring gives a whole-number age that is skewed towards younger people. Sex is a simple Bernoulli draw against `G.prob_male`, the global parameter introduced in @sec-run-configuration-and-orchestration. Every caller starts at the `Index_IUC` activity, because the index 111 call is by definition their first step. `gp` is empty for now: the generator in @sec-health-service-model fills it in with a GP surgery after the caller is created.
+
+### Disposition and primary care outcome {#sec-caller-and-call-dispositions-disposition}
+
+```{.python filename="caller.py:27-32" code-line-style="hi:3-5"}
+        # Choose the patient's initial 111 call disposition
+        # We can extend this to include symptom groups etc once we have this data
+        self.disposition = random.choices(CallDispositions.dx_codes.index, weights=CallDispositions.dx_codes["prob"])[0]
+        self.disposition_prob = CallDispositions.dx_codes.prob[CallDispositions.dx_codes.index == self.disposition][0]
+        self.pc_outcome = CallDispositions.dx_codes.pc_outcome[CallDispositions.dx_codes.index == self.disposition][0]
+        #print(f"PC outcome is {self.pc_outcome}")
+```
+
+`random.choices` picks one code from the table's index, with the `prob` column as weights. The weights add up to just under 1 (about 0.999), but `random.choices` normalises weights, so that doesn't matter. The next two lines use a boolean mask on the index to pull out the matching row's probability and outcome. The trailing `[0]` takes the first (and only) element of the resulting one-item Series.
+
+### Timely GP contact {#sec-caller-and-call-dispositions-gp-contact}
+
+```{.python filename="caller.py:33-36" code-line-style="hi:4"}
+        # Identify the proportion of calls that receieve a timely GP contact
+        prop = CallDispositions.gp_timely_contact.prop[CallDispositions.gp_timely_contact['pc_outcome'] == self.pc_outcome]
+        # Get probability value from uniform distribution. If less than prop then timely contact made, otherwise not.
+        self.gp_timely_callback = "yes" if ((random.uniform(0, 1) < list(prop)[0]) | (what_if_sim_run == 'Yes')) else "no"
+```
+
+The proportion for this caller's `pc_outcome` is looked up in the CSV table. A uniform random number below that proportion means "yes". The `|` with `what_if_sim_run == 'Yes'` is how the what-if scenario works: in those runs, every caller gets timely contact, regardless of the random draw. Note that the uniform number is still drawn in that case, because `|` (unlike `or`) evaluates both sides. This keeps the stream of random numbers the same shape in both scenarios.
+
+::: {.callout-note collapse="true" title="Refresher: weighted choice with random.choices"}
+`random.choices(population, weights=...)` returns a *list* of `k` items (default 1), sampled with replacement. That is why the code indexes with `[0]`. Weights are relative, so they don't need to sum to exactly 1.
+:::
+
+### Placeholder and journey state {#sec-caller-and-call-dispositions-state}
+
+```{.python filename="caller.py:38-48" code-line-style="hi:2"}
+        # Keep track of cumulatative time and exit after 4320 minutes i.e. 72 hours
+        self.time_since_call = 0
+
+        # Variables to keep track of time variables as the caller progresses through the model
+        # These are updated at every step
+        self.hour = 0
+        self.day = "Mon"
+        self.qtr = 1
+        self.weekday = "weekday"
+
+        self.last_step = 'None'
+```
+
+These fields are placeholders. `time_since_call` is a leftover: nothing reads or updates it (the journey tracks elapsed time in `timer`, which the loop compares with `G.pt_time_in_sim`). `hour`, `day`, `qtr` and `weekday` are overwritten once by the arrival generator, at the moment of the index call, so they describe the time of that call for the whole journey. `activity`, `timer` and `last_step` are the fields the journey updates (`last_step` only on the decision-tree route). `last_step` records where the caller was previously. @sec-patient-journey-process shows how the journey process moves the caller between services.
+
+## Conclusion {#sec-caller-and-call-dispositions-conclusion}
+
+A `Caller` is a small record built from three random draws (age and sex, a weighted disposition, and a yes/no for timely GP contact), plus some empty fields for the journey to fill in. `CallDispositions` supplies the two tables behind those draws, and the what-if flag simply forces the GP contact to "yes".
+
+Next, in [Patient Journey Process](#sec-patient-journey-process), we'll see how a SimPy process takes this caller and moves them between services for 72 hours.

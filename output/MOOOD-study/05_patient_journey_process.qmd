@@ -1,0 +1,255 @@
+# Patient Journey Process {#sec-patient-journey-process}
+
+In [Caller and Call Dispositions](#sec-caller-and-call-dispositions) we met the `Caller`: a person who has just made an index 111 call, carrying a disposition, a primary care outcome and a flag for timely GP contact. A `Caller` on its own does nothing, though. This chapter covers the piece of code that brings it to life: `HSM.patient_journey`, which walks the caller from service to service until they have been followed up for 72 hours.
+
+## The problem: what happens after the call? {#sec-patient-journey-process-motivation}
+
+Our central use case is a single caller. Suppose Alex rings 111 at 22:00 on a Tuesday. The model needs to answer a chain of questions. Where does Alex go next (GP, ED, 999, inpatient care, another 111/IUC contact, or the end of the journey)? How long do they wait before getting there? How long does the visit last? And then, from wherever they ended up, where do they go after that? All of this must be tracked on the simulation clock (introduced in [Health Service Model](#sec-health-service-model)) and recorded, until 72 hours have passed since Alex entered the model.
+
+::: {.column-margin}
+**Patient journey**: the ordered sequence of services one `Caller` visits after the index 111 call, until the follow-up window closes.
+:::
+
+That sequence is the **patient journey**. In code it is a single method, and one copy of it runs for every caller the arrival generator creates.
+
+## Key concepts {#sec-patient-journey-process-concepts}
+
+### A SimPy process is a generator {#sec-patient-journey-process-generator}
+
+A SimPy process is an ordinary Python generator function that the environment drives. Each time it hits `yield self.env.timeout(x)`, it is paused and SimPy resumes it once `x` units of simulated time have passed. Meanwhile the environment runs every other paused process whose time has come. This is how thousands of callers can be "in the system" at once without any threads.
+
+::: {.column-margin}
+**SimPy process / timeout**: a generator registered with `env.process(...)`; a `timeout` is the event it yields to sleep for a span of simulated time.
+:::
+
+Where the process begins is in the arrival generator from @sec-health-service-model:
+
+```{.python filename="hsm.py:171-171"}
+                self.env.process(self.patient_journey(pt))
+```
+
+Each new `Caller` (`pt`) gets its own journey process, and the arrival generator carries straight on to wait for the next call.
+
+### The follow-up window {#sec-patient-journey-process-window}
+
+Each caller is followed for a fixed time after entering the model. `G.pt_time_in_sim` is set in `g.py` as `4320`, with the comment "4320 for 72 hours". The simulation clock runs in minutes, so 4320 minutes is 72 hours. The loop condition compares this against `patient.timer`, the caller's elapsed time since they entered the model. This is the **follow-up window**. The environment is also run for `sim_duration + warm_up_duration + G.pt_time_in_sim` (`hsm.py:416`), which gives callers extra time after the arrival period. It does not give every caller a full 72 hours, though. The arrival generator checks the stop time only once, at the start (`hsm.py:160`), and then keeps creating callers until the clock stops. A caller who rings late in that extra stretch is cut off when the run ends, before their own 72 hours are up. Also, the window is tested only at the top of the loop, so the last wait or visit can run past 72 hours.
+
+::: {.callout-note title="In the study"}
+The 72-hour window comes from the study's data. The BMJ Open paper (Pilbery et al., 2023) searched linked records for other healthcare contacts within 72 hours of the index 111 call, and simulated callers are followed for the same span. Callers with no recorded contact in that time are the model's `End`. The paper reports that 38.8% of callers had no further contact and 47.6% went to primary care first. The HSMA talk describes the same idea: from any service, one possible next step is leaving the system because the three days are up.
+:::
+
+### In-hours and out-of-hours {#sec-patient-journey-process-ooh}
+
+The decision-tree option for choosing the next step needs to know whether the caller is within normal GP opening times:
+
+```{.python filename="hsm.py:228-240"}
+    def ooh(self, patient: Caller) -> str:
+        """
+        Determine whether the patient's index 111 call is in-hours or out-of-hours (ooh)
+
+        """
+        if patient.weekday != 'weekday':
+            return 'ooh'
+        elif patient.hour < 8:
+            return 'ooh'
+        elif patient.hour > 18:
+            return 'ooh'
+        else:
+            return 'in-hours'
+```
+
+Anything at a weekend, before 08:00, or in hour 19 or later counts as out-of-hours (`'ooh'`). Everything else is `'in-hours'`. Since the test is `hour > 18`, a call placed between 18:00 and 18:59 on a weekday still counts as in-hours, so in-hours runs from 08:00 to 18:59. The paper gives no hour boundaries, but notes that most primary care dispositions fall out of hours (Pilbery et al., 2023), which is why this split matters. Note that it reads `patient.hour` and `patient.weekday`, which were set from the call time on the `Caller`. The default routing does not use this check at all; only the `'tree'` transition type does.
+
+## The loop, step by step {#sec-patient-journey-process-loop}
+
+@fig-patient-journey-process-flow shows one iteration of the loop. Everything in it repeats until the caller reaches `End` or the 72 hours run out.
+
+```{mermaid}
+%%| label: fig-patient-journey-process-flow
+%%| fig-cap: "One iteration of the patient journey loop"
+flowchart TD
+    A[timer below 72 hours?] -->|no| Z[Stop]
+    A -->|yes| B[Increment instance_id]
+    B --> C[Choose next step]
+    C --> D[Update network edge count]
+    D --> E[Record scheduled event]
+    E --> F[Yield wait time]
+    F --> G{Next step is End?}
+    G -->|yes| Z
+    G -->|no| H[Record start event]
+    H --> I[Yield step_visit]
+    I --> J[Update patient.timer]
+    J --> A
+```
+
+### Setting up and choosing the next step
+
+```{.python filename="hsm.py:248-286" code-line-style="hi:3,hi:14,hi:31,hi:39"}
+        # Variable to keep track of the order of healthcare interactions.
+        # Index_IUC is always 0
+        instance_id = 0
+
+        # Capture current simulation time
+        patient_enters_sim = self.env.now
+
+        # Loop will keep iterating while patient time in sim is less than the time patients are to be followed up
+        # i.e. the pt_time_in_sim value (duration in hours)
+        while patient.timer < G.pt_time_in_sim:
+
+            # Add boolean to determine whether the patient is still within the simulation warm-up
+            # period. If so, then we will not record the patient progress
+            not_in_warm_up_period = False if self.env.now < self.warm_up_duration else True
+
+            # Increment instance_id
+            instance_id += 1
+
+            # Capture current patient actvity
+            current_step = patient.activity
+
+            # Determine the patient's next healthcare interaction
+            if self.transition_type == 'tree':
+                # Determine next step using a decision tree modle
+                # SPOILER: it was terrible!
+
+                # Check whether current time is in-hours or out-of-hours
+                ooh_check = self.ooh(patient)
+
+                # Use the next_destination_tree function to run the patient through the decision tree model
+                next_step = self.t.next_destination_tree(current_step, patient.pc_outcome, patient.gp_timely_callback, patient.qtr, patient.last_step, ooh_check)
+
+                # Before the current step becomes the 'next step', capture current step as previous step
+                # in the next iteration....if that makes sense.
+                patient.last_step = current_step
+            else:
+                # Default behaviour
+                # Next destination is determined by next_destination function.
+                next_step = "GP" if ((self.what_if_sim_run == 'Yes') & (current_step == 'Index_IUC')) else self.t.next_destination(patient.activity, patient.gp_timely_callback, patient.qtr)
+```
+
+The highlighted lines show the key ideas. `instance_id` counts the loop iterations for this caller, starting at 1 on the first pass (a code comment says `Index_IUC` is 0, but the increment happens before any row is written, so the index call's `completed` row and the first `scheduled` row both carry 1; see [Simulation Event Log and Network Data](#sec-simulation-event-log-and-network-data)). That lets each step in a journey be told apart in the event log. `not_in_warm_up_period` is recomputed every iteration, so events are only recorded once the clock has passed the warm-up period set up in @sec-run-configuration-and-orchestration. The next step comes from one of two places: the decision-tree model (when `transition_type` is `'tree'`), or the default `next_destination`. In a what-if run (`what_if_sim_run == 'Yes'`) the first step after the index call is forced to `"GP"`, which fits with timely GP contact always being "yes" there. How those sampling methods work is the subject of @sec-transitions-and-time-distributions.
+
+### Bookkeeping, waiting and visiting
+
+```{.python filename="hsm.py:288-332" code-line-style="hi:5-8,hi:24-25,hi:34-35,hi:38"}
+            # If next step is ED, we need to determine whether this will be an avoidable admission or not
+            ED_urgent = "not applicable"
+
+            # Prepare source and target variables for network dataframe
+            source = next((v for k, v in self.node_lookup.items() if k == current_step), None)
+            target = next((v for k, v in self.node_lookup.items() if k == next_step), None)
+
+            # Update network graph table
+            self.network_df['weight'] = self.network_df.apply(lambda x: x['weight'] + 1 if x['source'] == source and x['target'] == target else x['weight'], axis = 1)
+
+
+            if (patient.activity == 'Index_IUC') and not_in_warm_up_period:
+                # As a one-off, capture the completed Index IUC call
+                self.add_patient_result_row('completed', patient, instance_id, ED_urgent)
+
+            # Update current patient activity
+            patient.activity = next_step
+
+            # Prepare data for event being 'scheduled'
+            # The time between this and 'start' will be the queue time
+            # or wait time or time for the patient to have another
+            # interaction with a healthcare service.
+
+            if not_in_warm_up_period:
+                self.add_patient_result_row('scheduled', patient, instance_id, ED_urgent)
+
+            # Consult the wait_time function to find out how long until the next activity
+            wait_time = self.t.wait_time(current_step, patient.activity)
+            yield self.env.timeout(wait_time)
+
+            # Based on current patient activity, need to determine where they go next...
+            if(patient.activity == 'End'):
+                break
+            elif patient.activity == 'ED':
+                ED_urgent = "non_urgent" if self.t.avoidable_ed_admission(patient.pc_outcome, patient.gp_timely_callback) else "urgent"
+                if not_in_warm_up_period:
+                    self.add_patient_result_row('start', patient, instance_id, ED_urgent)
+                yield self.env.process(self.step_visit(patient, instance_id, ED_urgent))
+            else:
+                if not_in_warm_up_period:
+                    self.add_patient_result_row('start', patient, instance_id, ED_urgent)
+                yield self.env.process(self.step_visit(patient, instance_id, ED_urgent))
+
+            # Keep track of how long patient has been in sim
+            patient.timer = self.env.now - patient_enters_sim
+```
+
+In order, this block does the following.
+
+1. It adds one to the weight of the network edge from the current step to the next, which is the data later drawn as the network graph (see @sec-simulation-event-log-and-network-data).
+2. On the very first iteration it logs the index call itself as `completed`.
+3. It switches `patient.activity` to the new step and logs a `scheduled` event. The gap between `scheduled` and `start` is the wait.
+4. It yields `env.timeout(wait_time)`. This is where the process sleeps while the simulated caller waits.
+5. If the next step is `End`, it breaks out. If it is `ED`, it first decides whether the attendance was avoidable. Either way it logs `start`, then yields `step_visit` as a child process, so the journey resumes only once the visit has finished.
+6. Finally `patient.timer` is set to the time elapsed since the caller entered the model, which feeds back to the `while` condition.
+
+### The visit itself
+
+```{.python filename="hsm.py:335-348"}
+    def step_visit(self, patient: Caller, instance_id: int, ED_urgent: str) -> None:
+        """
+            Function to retrieve activity time for duration, wait for visit to complete
+            then write result to `result_df`
+        """
+
+        # Duration of visit
+        visit_duration = self.t.activity_time(patient.activity, ED_urgent)
+
+        # Wait until visit is over
+        yield self.env.timeout(visit_duration)
+
+        # Update results_df with current values
+        self.add_patient_result_row('completed', patient, instance_id, ED_urgent)
+```
+
+`step_visit` is itself a small generator process: sample a duration for the current activity, sleep for it, then log `completed`. Splitting it out keeps the main loop readable and means every visit, whatever the service, ends the same way. The `ED_urgent` value matters because `activity_time` uses it to choose a duration distribution for ED visits.
+
+So each loop iteration produces up to three event rows for one `instance_id`: `scheduled`, `start` and `completed`.
+
+## Under the hood: a sequence of events {#sec-patient-journey-process-sequence}
+
+@fig-patient-journey-process-sequence follows Alex through one iteration.
+
+```{mermaid}
+%%| label: fig-patient-journey-process-sequence
+%%| fig-cap: "One iteration for one caller, as seen by SimPy"
+sequenceDiagram
+    participant Env as SimPy env
+    participant PJ as patient_journey
+    participant T as Transitions
+    participant SV as step_visit
+    participant Log as results_df
+
+    Env->>PJ: resume process
+    PJ->>T: next_destination(activity, gp_timely_callback, qtr)
+    T-->>PJ: next step, e.g. GP
+    PJ->>Log: scheduled
+    PJ->>T: wait_time(current, next)
+    PJ-->>Env: yield timeout(wait_time)
+    Env->>PJ: resume after wait
+    PJ->>Log: start
+    PJ->>SV: env.process(step_visit)
+    SV->>T: activity_time(activity, ED_urgent)
+    SV-->>Env: yield timeout(visit_duration)
+    Env->>SV: resume after visit
+    SV->>Log: completed
+    SV-->>PJ: visit process finished
+```
+
+The important point is that the process hands control back to the environment twice per iteration, once for the wait and once (inside `step_visit`) for the visit. Between those yields, SimPy advances the clock and runs other callers' journeys. That interleaving is how the whole model produces overlapping patient flows from simple, sequential-looking code.
+
+## Why the log writes check the warm-up period twice {#sec-patient-journey-process-warm-up}
+
+::: {.callout-note collapse="true" title="Deep dive: warm-up guards"}
+The loop computes `not_in_warm_up_period` and wraps most `add_patient_result_row` calls in it. But `add_patient_result_row` itself also checks `self.env.now > self.warm_up_duration` before calling `store_patient_results` (`hsm.py:375`). The local flag is evaluated at the *start* of an iteration, so a step that began in the warm-up period gets no `scheduled` or `start` row, but if its visit finishes after the warm-up ends, its `completed` row is still logged, because `step_visit` has no local guard. The two checks also differ by one boundary instant: the local flag uses `<` and the inner check uses `>`. Note also that `step_visit` logs `completed` with no local guard, relying only on the check inside `add_patient_result_row`. So a visit that began during warm-up but finishes afterwards can appear with only a `completed` row. That is how the code behaves as written; when computing queue or visit times from the event log, keep only the `instance_id` values that have both `start` and `completed` rows (see [Simulation Event Log and Network Data](#sec-simulation-event-log-and-network-data)).
+:::
+
+## Conclusion {#sec-patient-journey-process-conclusion}
+
+A patient journey is one generator, `HSM.patient_journey`, run once per caller. It loops while the caller's elapsed time is under `G.pt_time_in_sim` (72 hours, held as 4320 minutes), choosing a next step, counting the network edge, logging `scheduled`, yielding a wait, logging `start`, and yielding to `step_visit` for the visit. The `ooh` helper supports the optional decision-tree routing, and the warm-up flag keeps early events out of the results.
+
+Next, in [Transitions and Time Distributions](#sec-transitions-and-time-distributions), we'll open up `Transitions` and see how `next_destination`, `wait_time`, `activity_time` and `avoidable_ed_admission` actually draw their answers.

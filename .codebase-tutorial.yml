@@ -1,0 +1,9 @@
+audience: intermediate
+format: book
+language: English
+output: output/MOOOD-study
+max_abstractions: 8
+exclude: ["tests/**", "docs/**", ".venv/**", "cache/**", "data/**", "output/**", "csv/*.sav", "assets/**", "model.log"]
+critique: on
+extensions: [code-window, code-line-style]
+focus: "Background, research context and terminology are in additional_documentation/ (BMJ Open paper and HSMA talk transcript); use them for the why, and the code for behaviour."
